@@ -6,9 +6,28 @@
 
 **Architecture:** 신규 component `cap_ha_control`가 LLM-visible tool 1개를 노출. LLM은 typed payload(target/action/brightness_pct/color/kelvin)만 채우고, schema validate → entity resolve → HA REST 또는 board driver 분기 → 한국어 message 작성을 모두 firmware가 담당. LLM은 결과 message를 verbatim echo. cap_mcp_client / cap_lua_* 는 enabled로 두되 LLM-visible cap_groups에서 제외.
 
-**Tech Stack:** ESP-IDF v5.5.4 / esp_http_client (HA REST POST + GET) / cJSON / NVS (token, ha_url, entity_cache) / claw_cap descriptor / lua_module_led_strip (board branch only, internal call) / 기존 setup_wizard 웹 UI.
+**Tech Stack:** ESP-IDF v5.5.4 / esp_http_client (HA REST POST + GET) / cJSON / NVS (token, ha_url, entity_cache) / claw_cap descriptor / espressif/led_strip ^3.0.3 managed component (board branch, direct C API; in-repo lua_module_led_strip과 동일 버전 핀). 기존 setup_wizard 웹 UI는 v3 흐름에서 변경되지 않음 — ha_url/ha_token은 v3에서 console (`ha_control --set-url/--set-token`)로만 입력.
 
 **Spec:** `smarthome-docs/superpowers/specs/2026-05-08-cap-ha-control-typed-tool-design.md` (commit `75944e7`).
+
+**Review revision pass 2 (2026-05-08):** 첫 8개 + 다음 5개 항목 반영됨.
+
+Pass 2 (5 items):
+- Task 2 step 14: `s_capability_group_infos[]`에도 cap_ha_control entry 추가 (UI/listing 일관성).
+- Task 6: `cap_ha_http_post_service`가 non-2xx에서 ESP_ERR_HTTP_CONNECT를 돌려주면 401 인증 실패 메시지가 가려짐 → 전송 성공 시 항상 ESP_OK 반환, status 판정은 caller가 함.
+- Task 1 step 2/3: 함수 시그니처가 `cap_mcp_call_remote_tool(const char *, cJSON **)`이므로 string rewrite가 아니라 cJSON 객체 조작으로 재작성. 빈 arguments + content text 안의 Error/FAIL 둘 다 root.isError로 박음. VLA 회피.
+- Task 9 step 5: `boot_fetch_task` forward declaration을 함수 본문 안이 아닌 파일 상단으로 이동 (nested extern 회피).
+- Task 9 buffer: `/api/states`용으로 별도 64KB `CAP_HA_STATES_BUF_BYTES` 도입 — service-call 16KB와 분리. 그래도 truncate 가능성은 best-effort로 명시.
+
+Pass 1 (8 items):
+1. Task 2: app_claw build wiring (`CMakeLists.txt`, `idf_component.yml`)을 같은 commit에 포함하도록 step 추가 (이게 빠지면 `#include "cap_ha_control.h"` 빌드 실패).
+2. Task 2/11: `cap_ha_group_init`을 `claw_cap_lifecycle_fn` (= `esp_err_t (*)(void)`)에 맞춰 인자 없는 시그니처로 수정.
+3. Task 8: `led_strip_set_pixel(r,g,b)` + RGB에 brightness 스케일 (HSV 우회). `idf_component.yml` deps를 `espressif/led_strip: ^3.0.3` (in-repo lua_module과 동일 핀)으로.
+4. Task 12: ha_url/ha_token 입력은 console-only로 결정. wizard NVS namespace(`app_config`)와 cap_ha_http NVS namespace(`ha_ctl`) split을 v3에서 미해결 — 통합은 v4.
+5. Task 6: "256자 제한 제거" 표현을 "URL 160B + token 4096B caller-provided"로 정정. 진짜 제한 제거는 v4의 `_alloc` helper.
+6. Task 1 step 3: 응답 본문에 Error/FAIL 신호 시 root JSON에 `isError:true` 명시 주입 (로깅만으론 LLM 차단 보장 안 됨).
+7. Task 12: `vis_cap_groups` 기본값을 sdkconfig가 아닌 `application/edge_agent/components/app_config/app_config.c:43` `APP_DEFAULT_LLM_VISIBLE_CAP_GROUPS`에 박음.
+8. Task 13: `skills_list.json`을 전체 교체가 아니라 4개 entry만 surgical 제거 (Python in-place patch).
 
 ---
 
@@ -37,11 +56,13 @@
 | 파일 | 작업 |
 |---|---|
 | `components/common/app_claw/Kconfig` | `APP_CLAW_CAP_HA_CONTROL` 토글 추가 |
+| `components/common/app_claw/CMakeLists.txt` | 조건부 `cap_ha_control` REQUIRES 추가 |
+| `components/common/app_claw/idf_component.yml` | 조건부 `cap_ha_control` dependency + path 추가 |
 | `components/common/app_claw/app_capabilities.c` | `app_cap_register_ha_control()` 추가 + 등록 dispatch |
 | `components/common/app_claw/app_claw.c:44` (`APP_SYSTEM_PROMPT_COMMON`) | verbatim echo + lua_*/mcp_call_tool 금지 라인 추가 |
 | `components/claw_capabilities/cap_mcp_client/src/cap_mcp_client_core.c` | (단기 patch) `arguments` 빈/누락 reject + Error/FAIL 본문 detect |
 | `application/edge_agent/sdkconfig.defaults` | `CONFIG_APP_CLAW_CAP_HA_CONTROL=y`, `CONFIG_CAP_HA_CONTROL_BOOT_FETCH_ENABLED=y` |
-| Setup wizard 웹 UI (jsx/html) + NVS bridge | `ha_url`, `ha_token` 필드 추가 + `vis_cap_groups` 기본값 갱신 |
+| `application/edge_agent/components/app_config/app_config.c` | `APP_DEFAULT_LLM_VISIBLE_CAP_GROUPS` 기본값 갱신 |
 
 삭제 (v2 cleanup):
 
@@ -79,47 +100,84 @@ Expected: clean (또는 v2 후속 작업 외 무관 항목 없음). 각 task는 
 
 문맥: spec § 12 단기 patch 통합. cap_ha_control이 ship되기 전에도 시연 안전성 보강. `arguments` 빈 객체로 흘러드는 path를 막고, LLM이 raw `mcp_call_tool`/lua 도구로 우회하는 자유도를 system prompt에서 제거.
 
-- [ ] **Step 1: cap_mcp_client_core.c의 arguments 파싱 위치 식별**
+- [ ] **Step 1: 실제 함수 시그니처 / arguments 흐름 식별**
 
 ```bash
-grep -n "arguments" components/claw_capabilities/cap_mcp_client/src/cap_mcp_client_core.c | head -20
+grep -n "cap_mcp_call_remote_tool\|cap_mcp_parse_common_input\|cJSON \*\*result_out" components/claw_capabilities/cap_mcp_client/src/cap_mcp_client_core.c | head -10
 ```
-Expected: `cap_mcp_call_execute` 또는 `cap_mcp_parse_call_input` 함수 안에서 arguments JSON object 추출 라인 발견.
 
-- [ ] **Step 2: 빈 arguments / 누락 시 즉시 reject 로직 추가**
+확인할 사실 (현재 코드):
+- `cap_mcp_call_remote_tool(const char *input_json, cJSON **result_out)` — caller-provided 문자열 buffer가 아니라 cJSON tree를 out-param으로 돌려준다.
+- `cap_mcp_parse_common_input(..., cJSON **arguments_out)` — input JSON을 파싱해 arguments cJSON object를 채워준다.
+- 응답 root는 line ~402의 `root = cJSON_CreateObject()` 이후 line ~430 부근에서 `content` / `isError` 필드를 채우는 흐름.
 
-해당 파싱 위치에서 다음을 가장 먼저 검사 (object 추출 직후, HTTP POST 빌드 전):
+따라서 패치는 **string rewrite가 아니라 cJSON 객체 조작**으로 한다.
+
+- [ ] **Step 2: 빈 arguments / 누락 시 cJSON-기반 reject**
+
+`cap_mcp_call_remote_tool` 안에서 `cap_mcp_parse_common_input(...)`이 ESP_OK로 돌아온 직후 (현재 line ~369 근처, `cap_mcp_build_full_url` 호출 전), 다음을 추가:
 
 ```c
-cJSON *args = cJSON_GetObjectItemCaseSensitive(input, "arguments");
-if (!args || !cJSON_IsObject(args) || cJSON_GetArraySize(args) == 0) {
-    snprintf(output, output_size,
-             "{\"isError\":true,\"content\":[{\"type\":\"text\",\"text\":"
-             "\"mcp_call_tool requires a non-empty 'arguments' object. "
-             "Use ha_control for smart-home control instead.\"}]}");
+/* Reject calls with missing/empty arguments object. v2 demos showed
+ * gpt-5-mini drifting to '{}' on the second round, after which HA
+ * silently failed while the LLM narrated success. */
+if (!arguments || !cJSON_IsObject(arguments) || cJSON_GetArraySize(arguments) == 0) {
+    cJSON *err_root = cJSON_CreateObject();
+    cJSON *content_arr = cJSON_AddArrayToObject(err_root, "content");
+    cJSON *text_obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(text_obj, "type", "text");
+    cJSON_AddStringToObject(text_obj, "text",
+        "mcp_call_tool requires a non-empty 'arguments' object. "
+        "For smart-home control use ha_control instead.");
+    cJSON_AddItemToArray(content_arr, text_obj);
+    cJSON_AddBoolToObject(err_root, "isError", true);
+    cJSON_Delete(arguments);
+    *result_out = err_root;
     ESP_LOGW(TAG, "rejecting mcp_call_tool: arguments missing/empty");
-    return ESP_ERR_INVALID_ARG;
+    return ESP_OK;  /* result_out carries isError:true — LLM-blocked at schema level */
 }
 ```
-정확한 변수명/output buffer 매크로는 함수 내부 패턴에 맞게 (e.g. `s_resp_buf`, `result_json`).
 
-- [ ] **Step 3: 응답 본문에 Error/FAIL 표시 시 success false 보장**
+(`return ESP_OK` 인 이유: out-param으로 isError 결과를 넘겨야 LLM에 도달한다. ESP_ERR_INVALID_ARG로 끝내면 caller가 result_out=NULL을 보고 generic error path로 빠진다.)
 
-`cap_mcp_call_execute` 응답 파싱 막바지에 다음 추가 (response body 문자열이 변수 `body` 또는 `s_resp.data`에 있다는 가정 — 코드 보고 정확한 변수로 치환):
+- [ ] **Step 3: 응답이 실패 신호를 담고 있으면 root cJSON에 isError:true 명시**
+
+현재 코드는 line ~408–417에서 RPC-level error를 root.error_message로만 박고 isError flag는 빼먹는다. line ~427–432에서 result.content / result.isError를 root에 복사하지만, MCP 서버가 isError를 빼먹고 content text에 "Error:" / "FAIL"만 박는 경우 root.isError가 없는 채 반환된다. 둘 다 LLM이 거짓 성공을 합성할 source가 된다.
+
+패치는 두 분기 모두에 isError 명시 보강:
+
+(1) RPC-level error 분기 (line ~408 근처, `if (cJSON_IsObject(error_obj)) { ... cJSON_AddStringToObject(root, "error_message", ...); ... }` 블록 안에서 `*result_out = root` 직전):
 
 ```c
-const char *body = s_resp.data;
-if (body) {
-    bool body_signals_failure =
-        (strstr(body, "\"isError\":true") != NULL) ||
-        (strstr(body, "Error:") != NULL) ||
-        (strstr(body, "FAIL") != NULL);
-    if (body_signals_failure) {
-        ESP_LOGW(TAG, "tool response signals failure; not echoing as success");
+    cJSON_AddBoolToObject(root, "isError", true);
+```
+
+(2) tools/result 분기 (line ~430의 `if (cJSON_IsBool(is_error)) { cJSON_AddBoolToObject(root, "isError", cJSON_IsTrue(is_error)); }` 블록을 다음으로 교체):
+
+```c
+bool flagged_error = cJSON_IsBool(is_error) && cJSON_IsTrue(is_error);
+if (!flagged_error && cJSON_IsArray(content)) {
+    /* Content array의 type=text 항목들을 훑어 실패 marker가 있으면 강제 flag. */
+    cJSON *item = NULL;
+    cJSON_ArrayForEach(item, content) {
+        const cJSON *type_j = cJSON_GetObjectItem(item, "type");
+        const cJSON *text_j = cJSON_GetObjectItem(item, "text");
+        if (cJSON_IsString(type_j) && cJSON_IsString(text_j) &&
+            strcmp(type_j->valuestring, "text") == 0) {
+            const char *t = text_j->valuestring;
+            if (strstr(t, "Error:") || strstr(t, "\"isError\":true") ||
+                strstr(t, "FAIL") || strstr(t, "fail:") || strstr(t, "ERROR")) {
+                flagged_error = true;
+                ESP_LOGW(TAG, "MCP content signalled failure; forcing isError=true");
+                break;
+            }
+        }
     }
 }
+cJSON_AddBoolToObject(root, "isError", flagged_error);
 ```
-이 정보는 caller가 보는 result_json에 그대로 보존되므로 LLM이 거짓 성공을 합성하기 어려워짐. 별도 wrap 없이 로깅만으로 충분 (실제 차단은 system prompt 강제 라인이 함).
+
+순수 cJSON 조작이므로 VLA / output_size escaping 문제 없음. 실패 source가 root.isError에 박혀 LLM이 schema 레벨에서 차단된다.
 
 - [ ] **Step 4: APP_SYSTEM_PROMPT_COMMON에 두 줄 추가**
 
@@ -192,9 +250,11 @@ EOF
 - Create: `components/claw_capabilities/cap_ha_control/src/cmd_cap_ha_control.c` (stub)
 - Create: `components/claw_capabilities/cap_ha_control/data/entities.default.json` (placeholder 1개 entry)
 - Modify: `components/common/app_claw/Kconfig`
+- Modify: `components/common/app_claw/CMakeLists.txt`
+- Modify: `components/common/app_claw/idf_component.yml`
 - Modify: `components/common/app_claw/app_capabilities.c`
 
-문맥: cap_mcp_client (`components/claw_capabilities/cap_mcp_client/`)를 reference로 동일한 패턴. 이 task 끝에 빌드는 통과하지만 LLM에 도구가 등록만 되어 있고 호출 시 stub 응답만 돌려줌.
+문맥: cap_mcp_client (`components/claw_capabilities/cap_mcp_client/`)를 reference로 동일한 패턴. 이 task 끝에 빌드는 통과하지만 LLM에 도구가 등록만 되어 있고 호출 시 stub 응답만 돌려줌. **중요**: app_claw는 sub-component를 두 곳에서 wiring한다 — `CMakeLists.txt`의 조건부 REQUIRES 블록 + `idf_component.yml`의 조건부 path. 이 둘에 cap_ha_control을 추가하지 않으면 다음 task에서 `#include "cap_ha_control.h"`가 빌드 실패한다.
 
 - [ ] **Step 1: 디렉터리 생성 + 엔트리 stub 파일들**
 
@@ -225,15 +285,21 @@ idf_component_register(
         json
         nvs_flash
         console
-        lua_module_led_strip
+        led_strip
 )
 ```
+
+(`led_strip`은 managed component `espressif/led_strip`이 노출하는 component 이름.)
 
 - [ ] **Step 3: `idf_component.yml` 작성**
 
 ```yaml
-dependencies: {}
+## IDF Component Manager Manifest File
+dependencies:
+  espressif/led_strip: ^3.0.3
 ```
+
+(in-repo `lua_module_led_strip`과 동일 버전 핀.)
 
 - [ ] **Step 4: `Kconfig` 작성**
 
@@ -305,7 +371,14 @@ esp_err_t cmd_cap_ha_control_register(void);
 #define CAP_HA_NVS_KEY_CACHE       "entity_cache"
 
 #define CAP_HA_HTTP_TIMEOUT_MS     8000
+
+/* Service-call response: HA가 service result만 돌려주므로 16KB 충분. */
 #define CAP_HA_RESPONSE_BUF_BYTES  (16 * 1024)
+/* /api/states full snapshot: HA 본체는 light/cover/switch/sensor/etc 통째라
+ * 16KB로는 흔히 잘린다. 64KB로 best-effort. 그래도 잘리면 truncate + WARN
+ * (정적 registry fallback이 있어 데모 blocker는 아니지만 enrichment는
+ * 부분적이다). v4에서 streaming parser로 교체 검토. */
+#define CAP_HA_STATES_BUF_BYTES    (64 * 1024)
 
 typedef struct {
     char id[64];              /* entity_id, e.g. "light.smart_bulb" or "board:onboard_rgb" */
@@ -386,10 +459,9 @@ static esp_err_t cap_ha_execute(const claw_cap_descriptor_t *descriptor,
     return cap_ha_core_execute(input_json, output_json, output_size);
 }
 
-static esp_err_t cap_ha_group_init(const claw_cap_group_t *group, void *user_ctx)
+/* claw_cap_lifecycle_fn = esp_err_t (*)(void) — see claw_cap.h. No params. */
+static esp_err_t cap_ha_group_init(void)
 {
-    (void)group;
-    (void)user_ctx;
     esp_err_t err = cap_ha_resolve_init();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "resolve_init returned %s — falling back to static-only registry",
@@ -604,7 +676,30 @@ esp_err_t cmd_cap_ha_control_register(void)
                 the LLM for verbatim echo.
 ```
 
-- [ ] **Step 12: `components/common/app_claw/app_capabilities.c` — register dispatch 추가**
+- [ ] **Step 12: `components/common/app_claw/CMakeLists.txt` — 조건부 REQUIRES 블록 추가**
+
+기존 `if(CONFIG_APP_CLAW_CAP_TIME) ... endif()` 블록 다음(또는 `CONFIG_APP_CLAW_CAP_*` 블록들이 모인 영역의 알파벳 순서에 맞는 자리)에 추가:
+
+```cmake
+if(CONFIG_APP_CLAW_CAP_HA_CONTROL)
+    list(APPEND app_claw_requires cap_ha_control)
+endif()
+```
+
+- [ ] **Step 13: `components/common/app_claw/idf_component.yml` — 조건부 dependency 추가**
+
+기존 `cap_files` / `cap_time` 등 항목과 같은 형태로 (`dependencies:` 매핑 안에) 추가:
+
+```yaml
+  cap_ha_control:
+    rules:
+      - if: $CONFIG{APP_CLAW_CAP_HA_CONTROL} == True
+    path: ../../claw_capabilities/cap_ha_control
+```
+
+(이 두 wiring이 빠지면 Step 14의 `app_cap_register_ha_control()`이 `#include "cap_ha_control.h"` 단계에서 빌드 실패한다.)
+
+- [ ] **Step 14: `components/common/app_claw/app_capabilities.c` — register dispatch 추가**
 
 `#if CONFIG_APP_CLAW_CAP_TIME` 블록 (line ~468) 다음 자리에 헤더 include 추가 (파일 상단의 cap_time include 옆):
 
@@ -628,18 +723,27 @@ static esp_err_t app_cap_register_ha_control(const app_claw_config_t *config,
 #endif
 ```
 
-같은 파일 내의 dispatch 테이블 (capability registration이 모이는 배열, `cap_time_register_group`이 호출되는 곳 근처)에서 cap_time 등록 라인 다음에 다음을 추가:
+그리고 같은 파일의 dispatch 테이블 `s_capability_group_entries[]` 배열 (cap_time entry 다음 자리)에 다음을 끼워 넣는다:
 
 ```c
 #if CONFIG_APP_CLAW_CAP_HA_CONTROL
-    ESP_RETURN_ON_ERROR(app_cap_register_ha_control(config, paths),
-                        TAG, "Failed to register cap_ha_control");
+    { "cap_ha_control", "HA Control", "Register HA control cap", false, NULL, app_cap_register_ha_control },
 #endif
 ```
 
-(정확한 dispatch 테이블 위치는 파일 상황에 맞게 — 기존 `app_cap_register_*` 호출 시퀀스 끝, app_capabilities.c의 `app_capabilities_register_all()` 또는 동등 함수 안.)
+엔트리 시그니처는 기존 패턴과 동일: `{ id, label, log_msg, requires_paths, prepare_fn, register_fn }`. cap_ha_control은 prepare 단계가 따로 없으므로 `prepare_fn = NULL`.
 
-- [ ] **Step 13: 빌드**
+**같은 파일의 두 번째 테이블 `s_capability_group_infos[]`에도 동일한 cap을 추가해야 한다** (UI / capability list 일관성 — 안 넣으면 wizard listing이나 cap inspection에서 안 보임). cap_time entry (`{ "cap_time", "Time", false }`) 다음 자리에:
+
+```c
+#if CONFIG_APP_CLAW_CAP_HA_CONTROL
+    { "cap_ha_control", "HA Control", false },
+#endif
+```
+
+infos 테이블 시그니처는 `{ id, label, requires_paths }` 3-tuple로 entries보다 짧다. 두 테이블 모두 같은 순서/같은 #if 가드를 유지.
+
+- [ ] **Step 15: 빌드**
 
 ```bash
 cd application/edge_agent
@@ -652,11 +756,13 @@ ls build/esp-idf/cap_ha_control/ 2>/dev/null
 ```
 Expected: `libcap_ha_control.a`, `*.o` 파일들.
 
-- [ ] **Step 14: commit**
+- [ ] **Step 16: commit**
 
 ```bash
 git add components/claw_capabilities/cap_ha_control/ \
         components/common/app_claw/Kconfig \
+        components/common/app_claw/CMakeLists.txt \
+        components/common/app_claw/idf_component.yml \
         components/common/app_claw/app_capabilities.c
 git commit -m "$(cat <<'EOF'
 feat(cap_ha_control): scaffold component (stub execute, descriptor only)
@@ -1167,7 +1273,7 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 **Files:**
 - Modify: `components/claw_capabilities/cap_ha_control/src/cap_ha_control_http.c`
 
-문맥: spec § 7 — Bearer 헤더, esp_http_client, 동적 alloc로 256자 제한 없음, response buffer 16 KB cap. NVS namespace `ha_ctl`에서 `ha_url`/`ha_token` 읽고 쓰기.
+문맥: spec § 7 — Bearer 헤더, esp_http_client, response buffer 16 KB cap. NVS namespace `ha_ctl`에서 `ha_url`/`ha_token` 읽고 쓰기. **버퍼 한계**: caller-provided buffer 패턴 유지 — URL은 160B(http(s)://host:port + 약간), token은 4096B(HA long-lived JWT 안전 마진). v2의 256B 제한은 token에 한해 4096B로 확장하여 해소; "제한 제거"가 아니다. 진짜 제거가 필요해지면 `cap_ha_http_get_url_alloc(char **out)` 시그니처로 별도 helper를 v4에서 추가.
 
 - [ ] **Step 1: NVS getter/setter 본구현**
 
@@ -1338,9 +1444,12 @@ esp_err_t cap_ha_http_post_service(const char *domain, const char *service,
     esp_http_client_cleanup(cli);
     ESP_LOGI(TAG, "POST result err=%s status=%d resp_len=%zu",
              esp_err_to_name(err), status, resp.len);
-    if (err != ESP_OK) return err;
-    if (status / 100 != 2) return ESP_ERR_HTTP_CONNECT;
-    return ESP_OK;
+    /* Contract: ESP_OK == HTTP transport completed (caller checks
+     * http_status_out for 2xx vs 4xx/5xx). Returning a hard error here
+     * for non-2xx would shadow the actual status (401 in particular)
+     * from the failure-message composer, which gives users a misleading
+     * "network err" instead of "인증 실패". esp_http_client convention. */
+    return err;
 }
 ```
 
@@ -1396,7 +1505,10 @@ esp_err_t cap_ha_http_get_states(char *response_buf, size_t response_buf_size)
     ESP_LOGI(TAG, "GET result err=%s status=%d resp_len=%zu",
              esp_err_to_name(err), status, resp.len);
     if (err != ESP_OK) return err;
-    if (status / 100 != 2) return ESP_ERR_HTTP_CONNECT;
+    if (status / 100 != 2) {
+        ESP_LOGW(TAG, "GET /api/states non-2xx (%d) — caller should treat as failure", status);
+        return ESP_ERR_HTTP_CONNECT;
+    }
     return ESP_OK;
 }
 ```
@@ -1416,10 +1528,11 @@ git add components/claw_capabilities/cap_ha_control/src/cap_ha_control_http.c
 git commit -m "feat(cap_ha_control): HA REST HTTP layer + NVS url/token
 
 Implements cap_ha_http_post_service / cap_ha_http_get_states using
-esp_http_client + Bearer header. URL and token are stored in NVS
-namespace 'ha_ctl' (keys: ha_url, ha_token), dynamically allocated to
-remove the v2 256-byte token cap. Response buffer is bounded at 16 KB
-with a soft truncate + warn log.
+esp_http_client + Bearer header. URL and token live in NVS namespace
+'ha_ctl' (keys: ha_url, ha_token); URL fits in 160B and token in 4096B
+(extended from v2's 256B; not 'unlimited' — caller-provided buffer
+pattern retained). Response buffer is bounded at 16 KB with a soft
+truncate + warn log.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ```
@@ -1662,33 +1775,23 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 **Files:**
 - Modify: `components/claw_capabilities/cap_ha_control/src/cap_ha_control_board.c`
 
-문맥: spec § 8 — v1.3 N16R8 clone (CH343), GPIO 48, COUNT 1. RGB→HSV 변환 후 set_pixel_hsv. v2의 rgb_purple_*.lua가 한 일을 cap 안으로 흡수. led_strip C API를 직접 호출 (lua wrapper 없이).
+문맥: spec § 8 — v1.3 N16R8 clone (CH343), GPIO 48, COUNT 1. RGB 직접 + brightness_pct 스케일 → `led_strip_set_pixel(handle, 0, r, g, b)`. v2의 rgb_purple_*.lua가 한 일을 cap 안으로 흡수. led_strip C API를 직접 호출 (lua wrapper 없이). HSV 변환 단계는 생략 — managed component v3에 `set_pixel_hsv`도 존재하지만 이미 `cap_ha_color_to_rgb`가 RGB를 만들고, brightness 스케일을 RGB에 곱하는 게 lua_module_led_strip의 기존 패턴과 일치(불필요한 색공간 round-trip 회피).
 
-먼저 led_strip C API가 component 외부에서 호출 가능한지 확인:
+managed component 버전은 in-repo lua_module과 일치시킨다 — `lua_module_led_strip`은 `^3.0.3`을 쓰므로 동일하게 고정.
 
-```bash
-find components/lua_modules/lua_module_led_strip -name "*.h" 2>/dev/null
-find components -name "led_strip.h" 2>/dev/null | head
-```
+- [ ] **Step 1: led_strip dependency를 cap_ha_control에 직접 추가**
 
-ESP-IDF managed component `espressif/led_strip`가 있을 가능성. 다음 단계는 그 헤더를 사용한다고 가정하고 작성. 실제 빌드 시 헤더 경로가 다르면 `idf.py menuconfig`로 의존성 추가 또는 lua_module 경유.
-
-- [ ] **Step 1: led_strip 헤더 의존성 결정 + CMakeLists 갱신**
-
-```bash
-grep -rn "led_strip_handle_t\|led_strip_new" components/lua_modules/lua_module_led_strip/ 2>/dev/null | head -10
-```
-
-`led_strip_new_rmt_device`/`led_strip_set_pixel_hsv` 등 ESP-IDF managed component API를 직접 사용 가능하면 그 dependency를 cap_ha_control의 `idf_component.yml`에 추가:
+cap_ha_control은 lua를 우회해 led_strip C API를 직접 쓴다. `components/claw_capabilities/cap_ha_control/idf_component.yml`을 다음으로 교체 (Task 2의 빈 deps 자리):
 
 ```yaml
+## IDF Component Manager Manifest File
 dependencies:
-  espressif/led_strip: "^2.5.5"
+  espressif/led_strip: ^3.0.3
 ```
 
-또는 lua_module_led_strip의 internal helper를 노출해 사용. 어느 쪽이든 빌드 통과가 기준.
+`CMakeLists.txt`의 `REQUIRES`에는 `led_strip`만 있으면 됨 (managed component가 자동 노출하는 component name과 동일). Task 2의 REQUIRES 목록에 `lua_module_led_strip`이 들어가 있으면 제거하고 `led_strip`만 둔다 — cap_ha_control이 lua wrapper에 의존할 필요는 없다.
 
-- [ ] **Step 2: `cap_ha_control_board.c` 본구현**
+- [ ] **Step 2: `cap_ha_control_board.c` 본구현 (RGB direct, brightness_pct는 RGB에 스케일)**
 
 ```c
 #include "cap_ha_control_internal.h"
@@ -1701,25 +1804,16 @@ static const char *TAG = "cap_ha_board";
 #define BOARD_RGB_GPIO    48
 #define BOARD_RGB_COUNT   1
 
-static esp_err_t color_to_hsv(const char *color, int *h, int *s, int *v)
+static void scale_rgb_by_pct(int rgb[3], int brightness_pct)
 {
-    int rgb[3];
-    esp_err_t err = cap_ha_color_to_rgb(color, rgb);
-    if (err != ESP_OK) return err;
-
-    /* RGB(0-255) → HSV(0-359, 0-255, 0-255) */
-    int max = rgb[0]; if (rgb[1] > max) max = rgb[1]; if (rgb[2] > max) max = rgb[2];
-    int min = rgb[0]; if (rgb[1] < min) min = rgb[1]; if (rgb[2] < min) min = rgb[2];
-    int delta = max - min;
-    int hue = 0;
-    if (delta == 0) hue = 0;
-    else if (max == rgb[0]) hue = (60 * (rgb[1] - rgb[2]) / delta + 360) % 360;
-    else if (max == rgb[1]) hue = (60 * (rgb[2] - rgb[0]) / delta) + 120;
-    else                    hue = (60 * (rgb[0] - rgb[1]) / delta) + 240;
-    *h = hue;
-    *s = (max == 0) ? 0 : (delta * 255 / max);
-    *v = max;
-    return ESP_OK;
+    if (brightness_pct <= 0) return;          /* unchanged: full color */
+    if (brightness_pct > 100) brightness_pct = 100;
+    for (int i = 0; i < 3; i++) {
+        int scaled = (rgb[i] * brightness_pct) / 100;
+        if (scaled < 0) scaled = 0;
+        if (scaled > 255) scaled = 255;
+        rgb[i] = scaled;
+    }
 }
 
 esp_err_t cap_ha_board_dispatch(const char *target, const char *action,
@@ -1773,21 +1867,25 @@ esp_err_t cap_ha_board_dispatch(const char *target, const char *action,
         return ESP_ERR_INVALID_ARG;
     }
 
-    int h = 0, s = 255, v = 255;
+    /* Color → RGB. Default = white. brightness_pct scales RGB directly
+     * (matches lua_module_led_strip's pattern: no HSV round-trip). */
+    int rgb[3];
     if (color && *color) {
-        if (color_to_hsv(color, &h, &s, &v) != ESP_OK) {
+        if (cap_ha_color_to_rgb(color, rgb) != ESP_OK) {
             led_strip_del(handle);
             snprintf(message_out, message_size,
                      "지원하지 않는 색상입니다 (color=%s).", color);
             return ESP_ERR_INVALID_ARG;
         }
     } else {
-        h = 0; s = 0; v = 255; /* default white */
+        rgb[0] = 255; rgb[1] = 255; rgb[2] = 255;
     }
-    if (brightness_pct > 0) v = (v * brightness_pct) / 100;
-    if (v < 1) v = 1;
+    scale_rgb_by_pct(rgb, brightness_pct);
+    /* Ensure the LED is visibly on if any rounding produced all-zero. */
+    if (rgb[0] == 0 && rgb[1] == 0 && rgb[2] == 0) rgb[0] = rgb[1] = rgb[2] = 1;
 
-    err = led_strip_set_pixel_hsv(handle, 0, h, s, v);
+    err = led_strip_set_pixel(handle, 0,
+                              (uint32_t)rgb[0], (uint32_t)rgb[1], (uint32_t)rgb[2]);
     if (err == ESP_OK) err = led_strip_refresh(handle);
     led_strip_del(handle);
     if (err != ESP_OK) {
@@ -1830,9 +1928,12 @@ git commit -m "feat(cap_ha_control): onboard board:onboard_rgb branch (GPIO 48)
 Implements the board branch of the typed tool: 'board:onboard_rgb'
 target is dispatched to a one-shot WS2812 driver call on GPIO 48
 (v1.3 N16R8 clone, verified in docs/learn/20260508-bathroom-rgb-demo-result-and-rgb-gpio.md).
-Color names go through cap_ha_color_to_rgb then RGB→HSV; brightness_pct
-scales V. Driver handle is opened, used, and deleted within the call so
-RMT channels are released between requests.
+Color names resolve via cap_ha_color_to_rgb; brightness_pct scales the
+RGB triple directly and the result is written with led_strip_set_pixel
+(matches the lua_module_led_strip pattern, no HSV round-trip). espressif/led_strip
+is pinned to ^3.0.3 to match the in-repo lua module. Driver handle is
+opened, used, and deleted within the call so RMT channels are released
+between requests.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ```
@@ -1998,9 +2099,12 @@ esp_err_t cap_ha_resolve_active_friendly_names(char *out_csv, size_t out_size)
 ```c
 esp_err_t cap_ha_resolve_refresh_from_ha(void)
 {
-    char *raw = malloc(CAP_HA_RESPONSE_BUF_BYTES);
+    /* /api/states는 home의 모든 entity를 한 번에 돌려줘서 service-call 응답
+     * (16KB)보다 훨씬 크다. 별도 64KB 버퍼로 best-effort 채취 — truncation은
+     * cap_ha_http_get_states 내부에서 WARN 로그만 남기고 partial JSON을 돌려준다. */
+    char *raw = malloc(CAP_HA_STATES_BUF_BYTES);
     if (!raw) return ESP_ERR_NO_MEM;
-    esp_err_t err = cap_ha_http_get_states(raw, CAP_HA_RESPONSE_BUF_BYTES);
+    esp_err_t err = cap_ha_http_get_states(raw, CAP_HA_STATES_BUF_BYTES);
     if (err != ESP_OK) { free(raw); return err; }
 
     cJSON *arr = cJSON_Parse(raw);
@@ -2067,16 +2171,25 @@ esp_err_t cap_ha_resolve_refresh_from_ha(void)
 
 - [ ] **Step 5: 부팅 시 background task 등록 (Wi-Fi up 후 1회)**
 
-`cap_ha_resolve_init` 본문에 task 시작 추가 (init 가장 끝에):
+**Forward declaration은 함수 안에 두면 안 된다** — C 표준상 nested function declaration이 일부 toolchain에서 깨질 수 있고, ESP-IDF가 `-Wnested-externs` 등 경고를 켤 가능성도 있다. 파일 상단(다른 static 함수들 forward decl 모이는 영역)에 #if 가드와 함께 둔다.
+
+파일 상단 (top-level static 선언 영역):
 
 ```c
 #if CONFIG_CAP_HA_CONTROL_BOOT_FETCH_ENABLED
-    static void boot_fetch_task(void *arg);
+static void boot_fetch_task(void *arg);
+#endif
+```
+
+`cap_ha_resolve_init` 본문 끝(다른 init 작업 후)에 task 시작:
+
+```c
+#if CONFIG_CAP_HA_CONTROL_BOOT_FETCH_ENABLED
     xTaskCreate(boot_fetch_task, "ha_ctl_boot", 6 * 1024, NULL, 4, NULL);
 #endif
 ```
 
-(forward 선언 + task 본문은 init 위 또는 아래에 정의):
+task 본문 정의는 같은 파일 어디든 (init 함수 위 또는 아래):
 
 ```c
 #if CONFIG_CAP_HA_CONTROL_BOOT_FETCH_ENABLED
@@ -2322,9 +2435,8 @@ static void compose_description(void)
     s_ha_descriptors[0].description = s_ha_description;
 }
 
-static esp_err_t cap_ha_group_init(const claw_cap_group_t *group, void *user_ctx)
+static esp_err_t cap_ha_group_init(void)
 {
-    (void)group; (void)user_ctx;
     esp_err_t err = cap_ha_resolve_init();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "resolve_init returned %s — using static-only registry",
@@ -2365,13 +2477,18 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 
 ---
 
-## Task 12: NVS / sdkconfig / vis_cap_groups 기본값 + Setup Wizard 필드
+## Task 12: sdkconfig + vis_cap_groups 기본값 (console-only token path)
 
 **Files:**
 - Modify: `application/edge_agent/sdkconfig.defaults`
-- Investigate + Modify: Setup wizard frontend (web UI) — 정확한 위치는 코드베이스 탐색 후 결정
+- Modify: `application/edge_agent/components/app_config/app_config.c`
 
-문맥: spec § 10 — `CONFIG_APP_CLAW_CAP_HA_CONTROL=y`, boot-fetch 활성화. `vis_cap_groups` 기본을 `cap_skill,cap_ha_control,cap_im_tg,cap_time,cap_system`로 갱신. Setup wizard에 ha_url/ha_token 필드 추가. wizard가 너무 깊은 작업이면 console fallback (--set-url/--set-token)으로 시연.
+문맥: spec § 10 — `CONFIG_APP_CLAW_CAP_HA_CONTROL=y`, boot-fetch 활성화. `vis_cap_groups` 기본값을 `cap_skill,cap_ha_control,cap_im_tg,cap_time,cap_system`로 갱신.
+
+**중요한 결정 (review feedback #4 반영)**: v3에서 ha_url/ha_token 입력 경로는 **console-only** (`ha_control --set-url <url>` / `--set-token <token>`)로 한정한다.
+- 이유: cap_ha_http_*는 NVS namespace `ha_ctl`을 직접 read/write하지만, 현재 setup wizard는 `app_config_t` (다른 NVS namespace/table)에 값을 박는 흐름이다. wizard에 ha_url/ha_token 필드만 추가하면 wizard에 입력해도 cap_ha_control이 못 읽는 split-brain이 생긴다.
+- v4에서 둘 중 하나로 통합: (a) wizard 핸들러가 `app_config_t`에 박지 않고 `cap_ha_http_set_url/set_token()`을 직접 호출, 또는 (b) cap_ha_http_*가 `app_config` API를 경유하도록 어댑터화. v3에서는 거기까지 안 간다.
+- v3 시연 흐름: 보드 erase-flash → wizard로 Wi-Fi/LLM/Telegram만 입력 → 부팅 후 USB 콘솔에서 `ha_control --set-url <ip>` + `--set-token <token>` 실행 → reboot.
 
 - [ ] **Step 1: sdkconfig.defaults 갱신**
 
@@ -2396,17 +2513,24 @@ CONFIG_APP_CLAW_CAP_HA_CONTROL=y
 CONFIG_CAP_HA_CONTROL_BOOT_FETCH_ENABLED=y
 ```
 
-- [ ] **Step 2: Setup wizard frontend — 위치 탐색**
+- [ ] **Step 2: `APP_DEFAULT_LLM_VISIBLE_CAP_GROUPS` 기본값 갱신**
 
-```bash
-grep -rln "vis_cap_groups\|tg_bot_token\|llm_api_key" application/edge_agent/ components/ --include="*.c" --include="*.html" --include="*.js" --include="*.jsx" --include="*.tsx" --include="*.json" 2>/dev/null | head -20
+`application/edge_agent/components/app_config/app_config.c:43` 의 매크로를 다음으로 교체:
+
+```c
+#define APP_DEFAULT_LLM_VISIBLE_CAP_GROUPS "cap_skill,cap_ha_control,cap_im_tg,cap_time,cap_system"
 ```
 
-발견된 위치에서 다음을 추가:
-- 새 NVS 키 `ha_url`, `ha_token`을 wizard 폼 필드로 등록 (label "HA URL", "HA Long-Lived Access Token")
-- `vis_cap_groups` 기본값 placeholder/default 값을 `cap_skill,cap_ha_control,cap_im_tg,cap_time,cap_system`로 변경
+(원래 빈 문자열 `""`였음. 이 default가 NVS에 빈 값일 때 fallback으로 들어간다 — `app_config.c:70`의 `APP_CONFIG_FIELD(llm_visible_cap_groups, "vis_cap_groups", APP_DEFAULT_LLM_VISIBLE_CAP_GROUPS)` 를 통해.)
 
-(편집 위치는 codebase에 따라 hammer가 들어가는 곳이 다름. wizard 확장이 어렵거나 시간이 부족하면 console `ha_control --set-url <url>` + `--set-token <token>`을 사용자 가이드로 만 두고 wizard 변경은 v4로 미룸.)
+기존 보드는 NVS에 빈 값 또는 v2 default를 들고 있을 수 있으므로 erase-flash 후 새 default가 적용된다는 점을 Task 14 step 1에서 확인.
+
+`sdkconfig`/`sdkconfig.defaults`에 vis_cap_groups 관련 키가 들어있으면 그쪽도 같이 정리(이전 시도의 잔재 방지):
+
+```bash
+grep -nE "vis_cap_groups|VISIBLE_CAP_GROUPS" application/edge_agent/sdkconfig*
+```
+Expected: 결과 없음. 있으면 라인 삭제.
 
 - [ ] **Step 3: 빌드**
 
@@ -2414,23 +2538,31 @@ grep -rln "vis_cap_groups\|tg_bot_token\|llm_api_key" application/edge_agent/ co
 cd application/edge_agent
 idf.py build
 ```
-Expected: 성공.
+Expected: 성공. `app_config.o`가 새 매크로 값을 박은 채 link 됨.
 
 - [ ] **Step 4: commit**
 
 ```bash
-git add application/edge_agent/sdkconfig.defaults
-# (frontend 변경분이 있으면 같이 add)
-git commit -m "config(cap_ha_control): enable cap_ha_control + boot-fetch by default
+git add application/edge_agent/sdkconfig.defaults \
+        application/edge_agent/components/app_config/app_config.c
+git commit -m "$(cat <<'EOF'
+config(cap_ha_control): enable cap_ha_control + boot-fetch + vis_cap_groups default
 
 sdkconfig.defaults pins APP_CLAW_CAP_HA_CONTROL=y and
 CAP_HA_CONTROL_BOOT_FETCH_ENABLED=y so a fresh build/flash brings the
-new tool online. Setup wizard fields for ha_url/ha_token and the new
-vis_cap_groups default land where the wizard frontend lives; for the
-demo, console --set-url / --set-token is the supported path if wizard
-changes are out of scope here.
+new tool online. APP_DEFAULT_LLM_VISIBLE_CAP_GROUPS becomes
+'cap_skill,cap_ha_control,cap_im_tg,cap_time,cap_system' so the LLM
+sees only the typed tool surface, not raw cap_lua / cap_mcp_client.
 
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+ha_url/ha_token input is intentionally console-only in v3
+(`ha_control --set-url` / `--set-token`); setup wizard integration is
+deferred to v4 because the wizard's app_config namespace and
+cap_ha_http_*'s 'ha_ctl' namespace need a deliberate adapter, not a
+field-add that would silently desync.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+EOF
+)"
 ```
 
 ---
@@ -2463,25 +2595,30 @@ rm -f application/edge_agent/main/lua_scripts/builtin/demo_secrets.lua
 rm -f application/edge_agent/fatfs_image/scripts/builtin/demo_secrets.lua
 ```
 
-- [ ] **Step 2: `skills_list.json`에서 4개 entry 제거**
+- [ ] **Step 2: `skills_list.json`에서 4개 entry 제거 (surgical patch)**
 
-`application/edge_agent/main/skills/skills_list.json`을 다음으로 교체 (`weather_search`만 남김):
+전체 교체는 위험하다 — 다른 사용자/branch가 추가한 skill entry를 날릴 수 있다. 다음 4개 id만 제거하는 JSON 패치 형태로 처리:
+- `bathroom_light_on`
+- `bathroom_light_off`
+- `rgb_purple_on`
+- `rgb_purple_off`
 
-```json
-{
-  "skills": [
-    {
-      "id": "weather_search",
-      "file": "weather.md",
-      "summary": "How to answer current weather, temperature, and forecast queries through direct web search capabilities.",
-      "cap_groups": [
-        "cap_time",
-        "cap_web_search"
-      ]
-    }
-  ]
-}
+Python으로 in-place patch (다른 entry는 보존):
+
+```bash
+python3 - <<'PY'
+import json, pathlib
+p = pathlib.Path("application/edge_agent/main/skills/skills_list.json")
+data = json.loads(p.read_text(encoding="utf-8"))
+remove = {"bathroom_light_on", "bathroom_light_off", "rgb_purple_on", "rgb_purple_off"}
+before = len(data.get("skills", []))
+data["skills"] = [s for s in data.get("skills", []) if s.get("id") not in remove]
+removed = before - len(data["skills"])
+p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+print(f"removed {removed} entries (expected 4); remaining {len(data['skills'])}")
+PY
 ```
+Expected: `removed 4 entries (expected 4); remaining N` (N >= 1 — 최소 `weather_search`는 남음). 결과가 `removed 4`가 아니면 working tree 상태가 예상과 다르다 — 중단 후 git diff 확인.
 
 - [ ] **Step 3: `.gitignore`에서 demo_secrets.lua 라인 제거**
 
@@ -2534,7 +2671,7 @@ EOF
 
 **Files:** (none — 보드 작업)
 
-문맥: 단일 build/flash로 인프라가 보드에 도달. erase-flash로 v2 잔재 NVS 정리 후 wizard/console로 ha_url/ha_token 입력. vis_cap_groups를 v3 기본값으로.
+문맥: 단일 build/flash로 인프라가 보드에 도달. erase-flash로 v2 잔재 NVS 정리 → wizard로 Wi-Fi/LLM/Telegram → 콘솔로 `ha_control --set-url/--set-token` (Task 12 결정: ha_url/ha_token은 v3 wizard에 없음). vis_cap_groups는 Task 12에서 박은 default가 자동 적용.
 
 - [ ] **Step 1: 풀 erase + flash**
 
@@ -2557,24 +2694,22 @@ monitor에서 다음 로그 라인을 확인:
 기대치 외:
 - `cap_lua` / `cap_mcp_client` 등록은 보이되 vis 출력에는 빠져 있어야 함 (Task 12 vis_cap_groups 확인).
 
-- [ ] **Step 3: SetupWizard 진입 + ha_url/ha_token 입력**
+- [ ] **Step 3: SetupWizard 진입 + 콘솔 ha_url/ha_token 입력 (분리)**
 
-웹 SetupWizard에서:
+웹 SetupWizard에서 (Wi-Fi/LLM/Telegram만):
 - Wi-Fi: `hyodol_practice` (또는 사용자)
 - LLM provider/profile: `openai`, model `gpt-5-mini`, key `OPENAI_API_KEY`
 - Telegram bot token: `TELEGRAM_BOT_TOKEN`
-- HA URL: `http://192.168.1.94:8123`
-- HA token: 새 발급된 long-lived token
-- vis_cap_groups: `cap_skill,cap_ha_control,cap_im_tg,cap_time,cap_system`
+- vis_cap_groups: 빈 값으로 두면 Task 12에서 박은 default(`cap_skill,cap_ha_control,cap_im_tg,cap_time,cap_system`)가 자동 적용. (또는 명시적으로 같은 값 입력해 NVS에 박아도 됨.)
 
-Wizard에 HA 필드가 없으면 monitor console에서:
+Wizard에는 ha_url/ha_token 필드가 v3에서 의도적으로 없다 (Task 12 결정). 모니터 콘솔(USB)에서 직접:
 
 ```
 ha_control --set-url http://192.168.1.94:8123
 ha_control --set-token <new_token>
 ```
 
-각각 `set_url: ESP_OK` / `set_token: ESP_OK` 출력.
+각각 `set_url: ESP_OK` / `set_token: ESP_OK` 출력 확인. 두 값은 NVS namespace `ha_ctl` 의 `ha_url` / `ha_token`에 저장된다 (cap_ha_http_*가 직접 read하는 경로).
 
 - [ ] **Step 4: 재부팅 + boot-fetch 동작 확인**
 
@@ -2745,7 +2880,7 @@ LLM은 자연어 → typed payload 변환만, firmware가 validate / resolve / d
 ## 적용된 변경
 - 신규 `components/claw_capabilities/cap_ha_control/` (1개 capability `ha_control`).
 - 정적 registry: `data/entities.default.json` (4 entries: 화장실 조명, 거실 커튼, 거실 콘센트, 보드 RGB).
-- HA REST direct (POST /api/services + GET /api/states), Bearer NVS, 동적 alloc로 256자 제한 제거.
+- HA REST direct (POST /api/services + GET /api/states), Bearer NVS (`ha_ctl/ha_url`, `ha_ctl/ha_token`); URL 160B / token 4096B caller-provided buffer (v2 256B 제한을 token 한해 4096B로 확장; full removal은 v4 `_alloc` helper로 후속).
 - Boot-fetch background task → /api/states → light/cover/switch 필터 → NVS `ha_ctl/entity_cache` blob.
 - Onboard `board:onboard_rgb` 분기 (GPIO 48, color→HSV).
 - Active registry friendly_names가 tool description에 inject — LLM fuzzy 매칭 책임.
@@ -2767,7 +2902,8 @@ LLM은 자연어 → typed payload 변환만, firmware가 validate / resolve / d
 - climate / fan / media_player / scene 도메인 → v4
 - HA secure NVS storage (현재 평문) → v4
 - 다중 entity 복합 명령의 부분 실패 처리 → v4
-- Setup wizard ha_url/ha_token 필드가 미반영이면 v4에서 wizard 갱신
+- Setup wizard ha_url/ha_token 필드 추가 + NVS namespace 통합 (`app_config` ↔ `ha_ctl`) → v4
+- `cap_ha_http_get_url_alloc(char **out)` / `_token_alloc` 으로 caller-buffer 한계 완전 제거 → v4
 ```
 
 `<측정값>`/`<확인>`/`<기록>`은 시연 후 직접 채움.
@@ -2811,7 +2947,7 @@ Expected: clean. Task 1–13 + 17 commit이 보임. demo_secrets / token 누출 
 - § 15 Demo guardrails → Task 14 + Task 17. ✅
 
 **2. Placeholder scan:**
-- Task 12 step 2 wizard 위치는 codebase 구조상 정확한 path를 task 실행 시점에 grep으로 결정 — placeholder 아님 (탐색 후 본구현). console fallback (`ha_control --set-url/--set-token`)이 항상 동작하므로 wizard 변경이 어렵거나 시간 부족 시 시연에 영향 없음.
+- Task 12는 review revision 이후 console-only로 명확히 결정됨. wizard frontend 변경은 v3 범위 밖이며 placeholder도 없음.
 - 그 외 모든 step에 실제 코드 / 명령 / expected output 포함.
 
 **3. Type consistency:**
@@ -2827,7 +2963,7 @@ Expected: clean. Task 1–13 + 17 commit이 보임. demo_secrets / token 누출 
 **5. TDD 적용도:**
 - Firmware 특성상 unit test framework 부재 → 검증은 console + Telegram 행동 테스트. spec § 11 7개 console case가 Task 15에 1:1 매핑됨. 코드 작성 시점이 아닌 build/flash 시점에 검증되는 한계 — v2 plan과 동일한 trade-off.
 
-큰 누락 없음. 단, Task 12 (Setup wizard)는 codebase 탐색 결과에 따라 console fallback only로 축소 가능 — 시연에 영향 없음.
+큰 누락 없음. Task 12는 review revision 이후 console-only로 lock-in 됨; wizard ha_url/ha_token 필드 추가는 v4 (NVS namespace 통합과 함께).
 
 ---
 
