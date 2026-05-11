@@ -51,7 +51,7 @@ static const char *APP_STARTUP_EVENT_KEY = "boot_completed";
     "When communicating with the user, refer to skills instead of Capabilities. " \
     "When a tool returns a 'message' field, respond to the user with that message verbatim — do not rephrase, do not add commentary, do not invent confirmation. " \
     "Do not claim a tool succeeded unless its 'success' field is true. " \
-    "For smart-home control (lights, curtains, switches, the onboard RGB LED) use the 'ha_control' tool only. Never call 'mcp_call_tool' or any 'lua_*' tool to control devices. "
+    "For smart-home control (lights, curtains, switches, the onboard RGB LED) use the 'ha_control' tool only. Never call 'mcp_call_tool' or any 'lua_*' tool to control devices. Never call 'activate_skill' for any skill whose id starts with 'lua_module_' — those skills are obsolete for device control; the 'ha_control' tool already covers all supported devices. "
 
 #if CONFIG_APP_CLAW_MEMORY_MODE_FULL
 #define APP_SYSTEM_PROMPT_SUFFIX \

@@ -22,7 +22,7 @@ static const char *TAG = "claw_cap";
 #define CLAW_CAP_DEFAULT_MAX_GROUPS       4
 #define CLAW_CAP_UNLOAD_POLL_MS          20
 
-#define CLAW_CAP_TOOL_DESCRIPTION_MAX 256
+#define CLAW_CAP_TOOL_DESCRIPTION_MAX 1024
 
 typedef struct {
     bool occupied;
