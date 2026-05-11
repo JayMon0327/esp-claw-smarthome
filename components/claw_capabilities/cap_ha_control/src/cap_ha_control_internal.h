@@ -75,3 +75,12 @@ esp_err_t cap_ha_board_dispatch(const char *target,
                                 const char *color,
                                 char *message_out,
                                 size_t message_size);
+
+/* color + message helpers (defined in cap_ha_control_core.c) */
+esp_err_t cap_ha_color_to_rgb(const char *color, int rgb_out[3]);
+void cap_ha_compose_success_message(const cap_ha_entity_t *e,
+                                    const char *action, int brightness_pct,
+                                    const char *color,
+                                    char *out, size_t out_size);
+void cap_ha_compose_failure_message(int http_status, esp_err_t http_err,
+                                    char *out, size_t out_size);
