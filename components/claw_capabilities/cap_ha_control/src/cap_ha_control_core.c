@@ -91,15 +91,18 @@ void cap_ha_compose_success_message(const cap_ha_entity_t *e,
 void cap_ha_compose_failure_message(int http_status, esp_err_t http_err,
                                     char *out, size_t out_size)
 {
-    if (http_err != ESP_OK) {
-        snprintf(out, out_size,
-                 "HA 호출이 실패했습니다 (network err=%s).",
-                 esp_err_to_name(http_err));
-    } else if (http_status == 401) {
+    /* 401 takes precedence over http_err: esp_http_client returns
+     * ESP_ERR_NOT_SUPPORTED for auth failures even though the HTTP
+     * exchange completed, and "network err" hides the real cause. */
+    if (http_status == 401 || http_status == 403) {
         snprintf(out, out_size, "HA 인증에 실패했습니다 (토큰 확인 필요).");
     } else if (http_status >= 400) {
         snprintf(out, out_size,
                  "HA 호출이 실패했습니다 (status=%d).", http_status);
+    } else if (http_err != ESP_OK) {
+        snprintf(out, out_size,
+                 "HA 호출이 실패했습니다 (network err=%s).",
+                 esp_err_to_name(http_err));
     } else {
         snprintf(out, out_size, "HA가 동작을 거부했습니다.");
     }
