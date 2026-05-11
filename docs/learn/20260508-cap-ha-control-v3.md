@@ -66,12 +66,34 @@ LLM은 자연어 → typed payload 변환만, firmware가 validate / resolve / d
 - `commit 32f527c`: `cap_ha_http_post_service` / `_get_states`의 `char auth_header[4128]`이 6KB boot-fetch task stack을 오버플로우. boot-fetch가 `GET /api/states` 직후 `Backtrace: ... |<-CORRUPTED` + `rst:0xc (RTC_SW_CPU_RST)` 무한 reboot 루프. heap으로 옮겨 해결.
 - `commit df783ea`: esp_http_client가 HTTP 401에 `ESP_ERR_NOT_SUPPORTED`를 반환 — `cap_ha_compose_failure_message`의 분기 순서가 http_err를 먼저 검사해 "network err=..."로 잘못 잡았음. http_status==401/403을 최우선으로 재정렬해 "HA 인증에 실패했습니다" 메시지 회복. 이 fix가 v3의 핵심 데모 guardrail — invalid token → LLM이 verbatim "인증 실패"로 응답 → false success 합성 차단.
 
-**남은 Task 16 — Telegram NL E2E (user 실행)**
-보드 firmware는 final 상태로 flash 완료. Telegram client에서 메시지를 보내야 검증 가능 (CLI 접근 불가):
-1. `/start` 새 세션 → "화장실 조명 켜줘" / "화장실 60%로 노란빛" / "보드 LED 보라색" 등 6 시나리오 — message verbatim echo 확인.
-2. 1 세션 20회 mixed — success rate 90%+ 확인.
-3. invalid token → "인증 실패" verbatim 확인 (firmware 측은 이미 검증됨).
-4. **사전 점검**: 보드 콘솔에서 `cap list` 출력에 `mcp_call_tool` / `mcp_list_tools` / cap_lua tools가 LLM-visible로 나오면 `app_config` NVS의 `vis_cap_groups`를 `cap_skill,cap_ha_control,cap_im_tg,cap_time,cap_system`로 명시 설정 (현재 NVS에 v2 시점 값이 남아 있어 새 default가 적용 안 됨).
+**Task 16 — Telegram NL E2E 시도 결과 (event_router emit_message로 simulate)**
+
+이 세션 내에서 콘솔 `event_router --emit-message --source-cap tg_gateway --channel telegram --chat-id <user_chat>`로 Telegram 사용자 입력을 시뮬레이트해봄. 결과:
+
+**발견 1 — `llm_visible_cap_groups` NVS stale**: app_config API `GET http://192.168.1.106/api/config` 응답에 `"llm_visible_cap_groups":"cap_skill,cap_im_tg,cap_time,cap_system"` (v2 시점 값으로 4 entries, cap_ha_control 빠짐). Task 12에서 박은 default가 NVS에 이미 값이 있어 적용 안 됨. `POST /api/config` with `{"llm_visible_cap_groups":"cap_skill,cap_ha_control,cap_im_tg,cap_time,cap_system"}` + `/api/restart`로 갱신. 이후 cap list에서 ha_control이 LLM tool로 노출됨.
+
+**발견 2 — claw_cap description 256B cap (commit `61e24ba`)**: `cap 'ha_control' description 404 bytes exceeds 256, truncating` 경고. 동적 friendly_names 리스트 + verbatim echo 룰이 잘려 LLM 컨텍스트에 미도달. `CLAW_CAP_TOOL_DESCRIPTION_MAX`를 256→1024로 확장.
+
+**발견 3 — Telegram 시뮬레이션 path가 ha_control 호출에 도달 못함**: description 확장 후에도 LLM(`gpt-5-mini`)이 `activate_skill("lua_module_led_strip")`을 시도하거나 사용자에게 명확화 질문(`"What should I do with the onboard RGB LED?"`)만 던지고 ha_control을 직접 호출하지 않음.
+- system prompt에 `Never call 'activate_skill' for any skill whose id starts with 'lua_module_'` 추가 (commit `61e24ba`).
+- 추가해도 LLM이 ha_control을 호출 안 함. `claw_core: Session History context_kind=messages context_len=1821` — **세션 히스토리가 NVS/fatfs에 persistent해 보드 reboot으로도 안 지워짐**. 명확화-모드에 들어간 LLM이 새 메시지를 prior turn 연속으로 해석. `cap call roll_chat_session {}` 콘솔 호출은 invocation은 됐지만 session history는 그대로.
+
+**Task 16 — user 실행 필요 (실 Telegram client)**
+
+- 실 Telegram client에서 `/start` 또는 새 chat으로 깨끗한 session 확보 후 6 시나리오 + 20회 mixed + invalid token 시연 (plan §16).
+- Telegram의 `/start`는 chat 자체를 새로 만드는 게 아니라서 보드 NVS session history는 그대로 — 추가 조치 필요할 수 있음:
+  - `cap call roll_chat_session {"chat_id":"8338032778","force_clear":true}` 시도 (인자 미확정)
+  - `/fatfs/sessions/...` 또는 NVS namespace `cap_session_mgr` 에서 직접 clear (debugged path 필요)
+  - 또는 firmware에 `--clear-session` console 옵션 추가 (v4)
+- 모델 격상 옵션: gpt-5-mini → gpt-5.4. spec §16.4 last-resort 항목.
+
+**On-board에서 검증된 핵심 데모 guardrail** (Task 1 + Task 15 + Task 16 §3 일부)
+- 거짓 성공 차단 (firmware level): invalid token → `success:false, raw_status:401, message:"HA 인증에 실패했습니다 (토큰 확인 필요)."`. LLM verbatim echo를 따르면 거짓 성공 0건.
+- v2 surface 차단 (system prompt): `mcp_call_tool` / `lua_*` / `activate_skill lua_module_*` 모두 금지.
+- Schema validation (firmware level): target/action 누락, action 외 enum, brightness/kelvin 범위 외 → 한국어 reject 메시지.
+- 보드 RGB direct dispatch + HA REST POST 모두 200 응답으로 verified.
+
+남은 위험은 LLM 행동(routing 의사결정)뿐 — firmware 측은 모든 spec 요구사항을 만족.
 
 ## v2 architecture와 비교
 - v2: argument-free 4 lua skill, LLM이 path만 선택 — 인자 표면 0이지만 entity 추가 = lua 4개 추가, 거짓 성공은 LLM 자체 합성에 의존.
