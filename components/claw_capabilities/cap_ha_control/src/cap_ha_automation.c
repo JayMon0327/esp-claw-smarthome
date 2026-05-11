@@ -311,6 +311,145 @@ static esp_err_t do_create(const cJSON *root, char *output, size_t output_size)
     return ESP_OK;
 }
 
+static esp_err_t do_remove(const cJSON *root, char *output, size_t output_size)
+{
+    const cJSON *id_j = cJSON_GetObjectItem(root, "automation_id");
+    if (!cJSON_IsString(id_j)) {
+        emit_auto_failure(output, output_size, "automation_id가 필요합니다.");
+        return ESP_OK;
+    }
+    /* Accept both 'esp_claw_<ts>' and 'automation.esp_claw_<ts>' forms. */
+    const char *id = id_j->valuestring;
+    if (strncmp(id, "automation.", 11) == 0) id += 11;
+
+    char http_resp[256];
+    int http_status = 0;
+    esp_err_t err = cap_ha_http_delete_automation_config(id, &http_status, http_resp, sizeof(http_resp));
+    if (err != ESP_OK || http_status / 100 != 2) {
+        char msg[200];
+        cap_ha_compose_failure_message(http_status, err, msg, sizeof(msg));
+        emit_auto_failure(output, output_size, msg);
+        return ESP_OK;
+    }
+    int reload_status = 0;
+    cap_ha_http_reload_automations(&reload_status, http_resp, sizeof(http_resp));
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "success", true);
+    char msg[160];
+    snprintf(msg, sizeof(msg), "자동화 'automation.%s'를 삭제했습니다.", id);
+    cJSON_AddStringToObject(resp, "message", msg);
+    cJSON_AddStringToObject(resp, "automation_id", id);
+    cJSON_AddNumberToObject(resp, "raw_status", http_status);
+    char *s = cJSON_PrintUnformatted(resp);
+    if (s) { snprintf(output, output_size, "%s", s); free(s); }
+    cJSON_Delete(resp);
+    return ESP_OK;
+}
+
+static esp_err_t do_list(char *output, size_t output_size)
+{
+    char *states = malloc(CAP_HA_STATES_BUF_BYTES);
+    if (!states) {
+        emit_auto_failure(output, output_size, "내부 오류 (메모리 부족).");
+        return ESP_OK;
+    }
+    esp_err_t err = cap_ha_http_get_states(states, CAP_HA_STATES_BUF_BYTES);
+    if (err != ESP_OK) {
+        free(states);
+        emit_auto_failure(output, output_size, "HA에서 자동화 목록을 가져오지 못했습니다.");
+        return ESP_OK;
+    }
+
+    cJSON *arr = cJSON_Parse(states);
+    free(states);
+    cJSON *out_arr = cJSON_CreateArray();
+    int count_total = 0, count_esp = 0;
+    if (cJSON_IsArray(arr)) {
+        cJSON *e = NULL;
+        cJSON_ArrayForEach(e, arr) {
+            const cJSON *eid = cJSON_GetObjectItemCaseSensitive(e, "entity_id");
+            if (!cJSON_IsString(eid) ||
+                strncmp(eid->valuestring, "automation.", 11) != 0) continue;
+            count_total++;
+            const cJSON *attr = cJSON_GetObjectItemCaseSensitive(e, "attributes");
+            const cJSON *fn = cJSON_GetObjectItemCaseSensitive(attr, "friendly_name");
+            const cJSON *st = cJSON_GetObjectItemCaseSensitive(e, "state");
+            cJSON *item = cJSON_CreateObject();
+            cJSON_AddStringToObject(item, "entity_id", eid->valuestring);
+            cJSON_AddStringToObject(item, "friendly_name",
+                                   cJSON_IsString(fn) ? fn->valuestring : "");
+            cJSON_AddStringToObject(item, "state",
+                                   cJSON_IsString(st) ? st->valuestring : "");
+            cJSON_AddBoolToObject(item, "esp_claw_managed",
+                                  strstr(eid->valuestring, "esp_claw_") != NULL);
+            cJSON_AddItemToArray(out_arr, item);
+            if (strstr(eid->valuestring, "esp_claw_")) count_esp++;
+        }
+    }
+    if (arr) cJSON_Delete(arr);
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "success", true);
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+             "자동화 %d건 (ESP-Claw 등록: %d건). HA UI에서 모두 확인 가능합니다.",
+             count_total, count_esp);
+    cJSON_AddStringToObject(resp, "message", msg);
+    cJSON_AddItemToObject(resp, "automations", out_arr);
+    char *s = cJSON_PrintUnformatted(resp);
+    if (s) { snprintf(output, output_size, "%s", s); free(s); }
+    cJSON_Delete(resp);
+    return ESP_OK;
+}
+
+static esp_err_t do_service(const cJSON *root, const char *service,
+                            const char *success_msg_fmt,
+                            char *output, size_t output_size)
+{
+    const cJSON *id_j = cJSON_GetObjectItem(root, "automation_id");
+    if (!cJSON_IsString(id_j)) {
+        emit_auto_failure(output, output_size, "automation_id가 필요합니다.");
+        return ESP_OK;
+    }
+    const char *id = id_j->valuestring;
+    if (strncmp(id, "automation.", 11) == 0) id += 11;
+    char entity_id[80];
+    snprintf(entity_id, sizeof(entity_id), "automation.%s", id);
+
+    char http_resp[256];
+    int http_status = 0;
+    esp_err_t err = cap_ha_http_call_automation_service(service, entity_id,
+                                                       &http_status, http_resp, sizeof(http_resp));
+    if (err != ESP_OK || http_status / 100 != 2) {
+        char msg[200];
+        cap_ha_compose_failure_message(http_status, err, msg, sizeof(msg));
+        emit_auto_failure(output, output_size, msg);
+        return ESP_OK;
+    }
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "success", true);
+    char msg[200];
+    snprintf(msg, sizeof(msg), success_msg_fmt, entity_id);
+    cJSON_AddStringToObject(resp, "message", msg);
+    cJSON_AddStringToObject(resp, "automation_id", id);
+    cJSON_AddNumberToObject(resp, "raw_status", http_status);
+    char *s = cJSON_PrintUnformatted(resp);
+    if (s) { snprintf(output, output_size, "%s", s); free(s); }
+    cJSON_Delete(resp);
+    return ESP_OK;
+}
+
+static esp_err_t do_trigger_now(const cJSON *root, char *out, size_t size) {
+    return do_service(root, "trigger", "'%s' 자동화를 즉시 실행했습니다.", out, size);
+}
+static esp_err_t do_enable(const cJSON *root, char *out, size_t size) {
+    return do_service(root, "turn_on", "'%s' 자동화를 활성화했습니다.", out, size);
+}
+static esp_err_t do_disable(const cJSON *root, char *out, size_t size) {
+    return do_service(root, "turn_off", "'%s' 자동화를 비활성화했습니다.", out, size);
+}
+
 esp_err_t cap_ha_automation_execute(const char *input_json,
                                     char *output_json,
                                     size_t output_size)
@@ -332,15 +471,20 @@ esp_err_t cap_ha_automation_execute(const char *input_json,
         return ESP_OK;
     }
 
-    esp_err_t r;
-    if (strcmp(action, "create") == 0) {
-        r = do_create(root, output_json, output_size);
-        cJSON_Delete(root);
-        return r;
+    esp_err_t r = ESP_OK;
+    if (strcmp(action, "create") == 0)            r = do_create(root, output_json, output_size);
+    else if (strcmp(action, "remove") == 0)       r = do_remove(root, output_json, output_size);
+    else if (strcmp(action, "list") == 0)         r = do_list(output_json, output_size);
+    else if (strcmp(action, "trigger_now") == 0)  r = do_trigger_now(root, output_json, output_size);
+    else if (strcmp(action, "enable") == 0)       r = do_enable(root, output_json, output_size);
+    else if (strcmp(action, "disable") == 0)      r = do_disable(root, output_json, output_size);
+    else if (strcmp(action, "update") == 0) {
+        emit_auto_failure(output_json, output_size,
+                          "update는 다음 task에서 구현됩니다.");
+    } else {
+        emit_auto_failure(output_json, output_size,
+                          "내부 오류 (action validation은 통과했으나 dispatch가 누락됨).");
     }
-
-    emit_auto_failure(output_json, output_size,
-                      "이 action은 다음 단계에서 구현됩니다 (Task 6.5/6.6).");
     cJSON_Delete(root);
-    return ESP_OK;
+    return r;
 }
