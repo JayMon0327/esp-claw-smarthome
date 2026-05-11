@@ -127,7 +127,13 @@ esp_err_t cap_ha_core_execute(const char *input_json,
         cJSON_AddStringToObject(out, "entity_id", entity.id);
         cJSON_AddNullToObject(out, "raw_status");
         char *s = cJSON_PrintUnformatted(out);
-        if (s) { snprintf(output_json, output_size, "%s", s); free(s); }
+        if (s) {
+            snprintf(output_json, output_size, "%s", s);
+            free(s);
+        } else {
+            snprintf(output_json, output_size,
+                     "{\"success\":false,\"message\":\"internal error\",\"entity_id\":null,\"raw_status\":null}");
+        }
         cJSON_Delete(out);
         cJSON_Delete(root);
         return ESP_OK;
