@@ -1,0 +1,21 @@
+idf_component_register(
+    SRCS
+        "src/cap_ha_control.c"
+        "src/cap_ha_control_core.c"
+        "src/cap_ha_control_resolve.c"
+        "src/cap_ha_control_http.c"
+        "src/cap_ha_control_board.c"
+        "src/cmd_cap_ha_control.c"
+    INCLUDE_DIRS
+        "include"
+        "src"
+    EMBED_TXTFILES
+        "data/entities.default.json"
+    REQUIRES
+        claw_cap
+        esp_http_client
+        json
+        nvs_flash
+        console
+        led_strip
+)

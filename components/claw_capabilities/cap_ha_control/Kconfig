@@ -1,0 +1,13 @@
+menu "cap_ha_control"
+
+    config CAP_HA_CONTROL_BOOT_FETCH_ENABLED
+        bool "Enrich entity registry from HA /api/states at boot"
+        default y
+        help
+            When enabled, cap_ha_control will fetch /api/states from HA
+            once after Wi-Fi connects and cache filtered entities (light,
+            cover, switch) into NVS as supplemental registry entries.
+            If HA is unreachable, the static entities.default.json is
+            used alone.
+
+endmenu

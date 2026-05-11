@@ -1,0 +1,10 @@
+{
+  "entities": [
+    {
+      "id": "board:onboard_rgb",
+      "friendly_name": "보드 RGB",
+      "domain": "board",
+      "supports": ["color", "brightness"]
+    }
+  ]
+}
