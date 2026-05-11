@@ -45,6 +45,11 @@ esp_err_t cap_ha_core_execute(const char *input_json,
                               char *output_json,
                               size_t output_size);
 
+/* Returns the HA service name (e.g. "turn_on", "open_cover") for a (domain, action)
+ * pair, or NULL if the combination is unsupported. Used by both ha_control dispatch
+ * and ha_automation translation. */
+const char *cap_ha_action_to_service(const char *domain, const char *action);
+
 esp_err_t cap_ha_automation_execute(const char *input_json,
                                     char *output_json,
                                     size_t output_size);

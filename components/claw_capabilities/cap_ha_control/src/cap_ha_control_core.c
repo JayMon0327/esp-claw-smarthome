@@ -130,6 +130,25 @@ static void emit_failure(char *output, size_t output_size, const char *message)
     cJSON_Delete(root);
 }
 
+const char *cap_ha_action_to_service(const char *domain, const char *action)
+{
+    if (!domain || !action) return NULL;
+    if (strcmp(domain, "light") == 0) {
+        if (strcmp(action, "turn_on") == 0)  return "turn_on";
+        if (strcmp(action, "turn_off") == 0) return "turn_off";
+        if (strcmp(action, "toggle") == 0)   return "toggle";
+    } else if (strcmp(domain, "cover") == 0) {
+        if (strcmp(action, "open") == 0)     return "open_cover";
+        if (strcmp(action, "close") == 0)    return "close_cover";
+        if (strcmp(action, "toggle") == 0)   return "toggle";
+    } else if (strcmp(domain, "switch") == 0) {
+        if (strcmp(action, "turn_on") == 0)  return "turn_on";
+        if (strcmp(action, "turn_off") == 0) return "turn_off";
+        if (strcmp(action, "toggle") == 0)   return "toggle";
+    }
+    return NULL;
+}
+
 esp_err_t cap_ha_core_execute(const char *input_json,
                               char *output_json,
                               size_t output_size)
@@ -229,20 +248,7 @@ esp_err_t cap_ha_core_execute(const char *input_json,
     }
 
     /* HA branch — service mapping per spec section 5. */
-    const char *svc = NULL;
-    if (strcmp(entity.domain, "light") == 0) {
-        if (strcmp(action, "turn_on") == 0)        svc = "turn_on";
-        else if (strcmp(action, "turn_off") == 0)  svc = "turn_off";
-        else if (strcmp(action, "toggle") == 0)    svc = "toggle";
-    } else if (strcmp(entity.domain, "cover") == 0) {
-        if (strcmp(action, "open") == 0)           svc = "open_cover";
-        else if (strcmp(action, "close") == 0)     svc = "close_cover";
-        else if (strcmp(action, "toggle") == 0)    svc = "toggle";
-    } else if (strcmp(entity.domain, "switch") == 0) {
-        if (strcmp(action, "turn_on") == 0)        svc = "turn_on";
-        else if (strcmp(action, "turn_off") == 0)  svc = "turn_off";
-        else if (strcmp(action, "toggle") == 0)    svc = "toggle";
-    }
+    const char *svc = cap_ha_action_to_service(entity.domain, action);
     if (!svc) {
         char msg[200];
         snprintf(msg, sizeof(msg),
