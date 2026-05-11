@@ -6,6 +6,7 @@
 #include "cap_ha_control_internal.h"
 #include "cJSON.h"
 #include "esp_log.h"
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,6 +43,9 @@ esp_err_t cap_ha_color_to_rgb(const char *color, int rgb_out[3])
     if (!color || !*color) return ESP_ERR_INVALID_ARG;
 
     if (color[0] == '#' && strlen(color) == 7) {
+        for (size_t i = 1; i < 7; i++) {
+            if (!isxdigit((unsigned char)color[i])) return ESP_ERR_INVALID_ARG;
+        }
         char r[3] = { color[1], color[2], 0 };
         char g[3] = { color[3], color[4], 0 };
         char b[3] = { color[5], color[6], 0 };
