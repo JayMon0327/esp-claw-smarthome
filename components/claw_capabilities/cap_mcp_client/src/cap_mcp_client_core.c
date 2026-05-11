@@ -371,6 +371,35 @@ esp_err_t cap_mcp_call_remote_tool(const char *input_json, cJSON **result_out)
         return err;
     }
 
+    /* Reject calls with missing/empty arguments object. v2 demos showed
+     * gpt-5-mini drifting to '{}' on the second round, after which HA
+     * silently failed while the LLM narrated success. */
+    if (!arguments || !cJSON_IsObject(arguments) || cJSON_GetArraySize(arguments) == 0) {
+        cJSON *err_root = cJSON_CreateObject();
+        if (!err_root) {
+            cJSON_Delete(arguments);
+            return ESP_ERR_NO_MEM;
+        }
+        cJSON *content_arr = cJSON_AddArrayToObject(err_root, "content");
+        cJSON *text_obj = cJSON_CreateObject();
+        if (!content_arr || !text_obj) {
+            cJSON_Delete(text_obj);
+            cJSON_Delete(err_root);
+            cJSON_Delete(arguments);
+            return ESP_ERR_NO_MEM;
+        }
+        cJSON_AddStringToObject(text_obj, "type", "text");
+        cJSON_AddStringToObject(text_obj, "text",
+            "mcp_call_tool requires a non-empty 'arguments' object. "
+            "For smart-home control use ha_control instead.");
+        cJSON_AddItemToArray(content_arr, text_obj);
+        cJSON_AddBoolToObject(err_root, "isError", true);
+        cJSON_Delete(arguments);
+        *result_out = err_root;
+        ESP_LOGW(TAG, "rejecting mcp_call_tool: arguments missing/empty");
+        return ESP_OK;  /* result_out carries isError:true — LLM-blocked at schema level */
+    }
+
     cap_mcp_build_full_url(server_url_buf, endpoint_buf, full_url, sizeof(full_url));
     if (full_url[0] == '\0') {
         cJSON_Delete(arguments);
@@ -412,6 +441,7 @@ esp_err_t cap_mcp_call_remote_tool(const char *input_json, cJSON **result_out)
         cJSON_AddStringToObject(root,
                                 "error_message",
                                 cJSON_IsString(message) ? message->valuestring : "Unknown MCP error");
+        cJSON_AddBoolToObject(root, "isError", true);
         cJSON_Delete(response);
         *result_out = root;
         return ESP_OK;
@@ -427,9 +457,26 @@ esp_err_t cap_mcp_call_remote_tool(const char *input_json, cJSON **result_out)
     cJSON *content = cJSON_GetObjectItem(result, "content");
     cJSON *is_error = cJSON_GetObjectItem(result, "isError");
     cJSON_AddItemToObject(root, "content", content ? cJSON_Duplicate(content, 1) : cJSON_CreateArray());
-    if (cJSON_IsBool(is_error)) {
-        cJSON_AddBoolToObject(root, "isError", cJSON_IsTrue(is_error));
+    bool flagged_error = cJSON_IsBool(is_error) && cJSON_IsTrue(is_error);
+    if (!flagged_error && cJSON_IsArray(content)) {
+        /* Content array의 type=text 항목들을 훑어 실패 marker가 있으면 강제 flag. */
+        cJSON *item = NULL;
+        cJSON_ArrayForEach(item, content) {
+            const cJSON *type_j = cJSON_GetObjectItem(item, "type");
+            const cJSON *text_j = cJSON_GetObjectItem(item, "text");
+            if (cJSON_IsString(type_j) && cJSON_IsString(text_j) &&
+                strcmp(type_j->valuestring, "text") == 0) {
+                const char *t = text_j->valuestring;
+                if (strstr(t, "Error:") || strstr(t, "\"isError\":true") ||
+                    strstr(t, "FAIL") || strstr(t, "fail:") || strstr(t, "ERROR")) {
+                    flagged_error = true;
+                    ESP_LOGW(TAG, "MCP content signalled failure; forcing isError=true");
+                    break;
+                }
+            }
+        }
     }
+    cJSON_AddBoolToObject(root, "isError", flagged_error);
 
     cJSON_Delete(response);
     *result_out = root;

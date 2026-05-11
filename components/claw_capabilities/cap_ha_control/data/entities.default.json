@@ -1,0 +1,28 @@
+{
+  "entities": [
+    {
+      "id": "light.smart_bulb",
+      "friendly_name": "화장실 조명",
+      "domain": "light",
+      "supports": ["brightness", "color"]
+    },
+    {
+      "id": "cover.zemismart_smart_curtain",
+      "friendly_name": "거실 커튼",
+      "domain": "cover",
+      "supports": []
+    },
+    {
+      "id": "switch.living_room_outlet",
+      "friendly_name": "거실 콘센트",
+      "domain": "switch",
+      "supports": []
+    },
+    {
+      "id": "board:onboard_rgb",
+      "friendly_name": "보드 RGB",
+      "domain": "board",
+      "supports": ["color", "brightness"]
+    }
+  ]
+}

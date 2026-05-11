@@ -128,6 +128,16 @@ menu "App Claw Config"
                 Enable the time capability and keep app_claw's direct dependency
                 on cap_time.
 
+        config APP_CLAW_CAP_HA_CONTROL
+            bool "Enable HA control capability"
+            default y
+            help
+                Enable the cap_ha_control capability and keep app_claw's direct
+                dependency on cap_ha_control. Provides a single typed tool
+                'ha_control' that owns smart-home dispatch (HA REST + onboard
+                board RGB) and exposes structured success/message contracts to
+                the LLM for verbatim echo.
+
         config APP_CLAW_CAP_LLM_INSPECT
             bool "Enable LLM inspect capability"
             default y

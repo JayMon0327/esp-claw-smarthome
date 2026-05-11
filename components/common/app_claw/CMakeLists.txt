@@ -86,6 +86,10 @@ if(CONFIG_APP_CLAW_CAP_TIME)
     list(APPEND app_claw_requires cap_time)
 endif()
 
+if(CONFIG_APP_CLAW_CAP_HA_CONTROL)
+    list(APPEND app_claw_requires cap_ha_control)
+endif()
+
 if(CONFIG_APP_CLAW_CAP_WEB_SEARCH)
     list(APPEND app_claw_requires cap_web_search)
 endif()

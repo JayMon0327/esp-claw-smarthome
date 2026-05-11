@@ -59,6 +59,9 @@
 #if CONFIG_APP_CLAW_CAP_TIME
 #include "cap_time.h"
 #endif
+#if CONFIG_APP_CLAW_CAP_HA_CONTROL
+#include "cap_ha_control.h"
+#endif
 #if CONFIG_APP_CLAW_CAP_WEB_SEARCH
 #include "cap_web_search.h"
 #endif
@@ -475,6 +478,16 @@ static esp_err_t app_cap_register_time(const app_claw_config_t *config,
 }
 #endif
 
+#if CONFIG_APP_CLAW_CAP_HA_CONTROL
+static esp_err_t app_cap_register_ha_control(const app_claw_config_t *config,
+                                             const app_claw_storage_paths_t *paths)
+{
+    (void)config;
+    (void)paths;
+    return cap_ha_control_register_group();
+}
+#endif
+
 #if CONFIG_APP_CLAW_CAP_LLM_INSPECT
 static esp_err_t app_cap_register_llm_inspect(const app_claw_config_t *config,
                                               const app_claw_storage_paths_t *paths)
@@ -576,6 +589,9 @@ static const app_capability_group_entry_t s_capability_group_entries[] = {
 #if CONFIG_APP_CLAW_CAP_TIME
     { "cap_time", "Time", "Register time cap", false, NULL, app_cap_register_time },
 #endif
+#if CONFIG_APP_CLAW_CAP_HA_CONTROL
+    { "cap_ha_control", "HA Control", "Register HA control cap", false, NULL, app_cap_register_ha_control },
+#endif
 #if CONFIG_APP_CLAW_CAP_LLM_INSPECT
     { "cap_llm_inspect", "LLM Inspect", "Register LLM inspect cap", false, NULL, app_cap_register_llm_inspect },
 #endif
@@ -632,6 +648,9 @@ static const app_capability_group_info_t s_capability_group_infos[] = {
 #endif
 #if CONFIG_APP_CLAW_CAP_TIME
     { "cap_time", "Time", false },
+#endif
+#if CONFIG_APP_CLAW_CAP_HA_CONTROL
+    { "cap_ha_control", "HA Control", false },
 #endif
 #if CONFIG_APP_CLAW_CAP_LLM_INSPECT
     { "cap_llm_inspect", "LLM Inspect", false },

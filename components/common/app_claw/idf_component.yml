@@ -4,6 +4,11 @@ dependencies:
       - if: $CONFIG{APP_CLAW_CAP_FILES} == True
     path: ../../claw_capabilities/cap_files
 
+  cap_ha_control:
+    rules:
+      - if: $CONFIG{APP_CLAW_CAP_HA_CONTROL} == True
+    path: ../../claw_capabilities/cap_ha_control
+
   cap_im_attachment:
     rules:
       - if: $CONFIG{APP_CLAW_CAP_IM_QQ} == True || $CONFIG{APP_CLAW_CAP_IM_FEISHU} == True || $CONFIG{APP_CLAW_CAP_IM_TG} == True || $CONFIG{APP_CLAW_CAP_IM_WECHAT} == True
