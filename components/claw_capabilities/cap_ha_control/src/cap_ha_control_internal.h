@@ -24,6 +24,7 @@
  * (정적 registry fallback이 있어 데모 blocker는 아니지만 enrichment는
  * 부분적이다). v4에서 streaming parser로 교체 검토. */
 #define CAP_HA_STATES_BUF_BYTES    (64 * 1024)
+#define CAP_HA_MAX_REGISTRY_ENTRIES 64
 
 typedef struct {
     char id[64];              /* entity_id, e.g. "light.smart_bulb" or "board:onboard_rgb" */

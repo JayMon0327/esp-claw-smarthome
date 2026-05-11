@@ -99,6 +99,11 @@ static esp_err_t parse_registry(const char *json_str, cap_ha_registry_t *out)
         return ESP_ERR_INVALID_ARG;
     }
     int count = cJSON_GetArraySize(entities);
+    if (count > CAP_HA_MAX_REGISTRY_ENTRIES) {
+        ESP_LOGW(TAG, "registry entry count %d exceeds cap %d; truncating",
+                 count, CAP_HA_MAX_REGISTRY_ENTRIES);
+        count = CAP_HA_MAX_REGISTRY_ENTRIES;
+    }
     if (count <= 0) {
         cJSON_Delete(root);
         out->items = NULL;
@@ -111,6 +116,7 @@ static esp_err_t parse_registry(const char *json_str, cap_ha_registry_t *out)
     int written = 0;
     cJSON *e = NULL;
     cJSON_ArrayForEach(e, entities) {
+        if (written >= count) break;
         const cJSON *id_j = cJSON_GetObjectItemCaseSensitive(e, "id");
         const cJSON *name_j = cJSON_GetObjectItemCaseSensitive(e, "friendly_name");
         const cJSON *domain_j = cJSON_GetObjectItemCaseSensitive(e, "domain");
