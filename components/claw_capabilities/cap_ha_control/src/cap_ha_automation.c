@@ -189,6 +189,128 @@ static esp_err_t build_ha_trigger_array(const cJSON *trigger_in,
     return ESP_OK;
 }
 
+static esp_err_t do_create(const cJSON *root, char *output, size_t output_size)
+{
+    const cJSON *target_j = cJSON_GetObjectItem(root, "target");
+    const cJSON *dev_action_j = cJSON_GetObjectItem(root, "device_action");
+    const cJSON *trigger_in = cJSON_GetObjectItem(root, "trigger");
+    const cJSON *alias_j = cJSON_GetObjectItem(root, "alias");
+    if (!cJSON_IsString(target_j) || !cJSON_IsString(dev_action_j) ||
+        !cJSON_IsObject(trigger_in)) {
+        emit_auto_failure(output, output_size,
+                          "자동화 등록에는 trigger / target / device_action이 모두 필요합니다.");
+        return ESP_OK;
+    }
+
+    /* Reject board:* targets — HA can't automate on-board entities. */
+    if (strncmp(target_j->valuestring, "board:", 6) == 0) {
+        emit_auto_failure(output, output_size,
+                          "보드 자체 자동화는 v5에서 지원될 예정입니다. v4에서는 HA 기기만 자동화 가능합니다.");
+        return ESP_OK;
+    }
+
+    cap_ha_entity_t entity = {0};
+    if (cap_ha_resolve_target(target_j->valuestring, &entity) != ESP_OK) {
+        char candidates[192];
+        cap_ha_resolve_top_candidates(candidates, sizeof(candidates), 5);
+        char msg[320];
+        snprintf(msg, sizeof(msg),
+                 "\"%s\"에 해당하는 기기를 찾지 못했습니다. 사용 가능한 기기: %s.",
+                 target_j->valuestring, candidates);
+        emit_auto_failure(output, output_size, msg);
+        return ESP_OK;
+    }
+    if (strncmp(entity.domain, "board", 5) == 0) {
+        emit_auto_failure(output, output_size,
+                          "보드 자체 자동화는 v5에서 지원될 예정입니다.");
+        return ESP_OK;
+    }
+
+    int brightness_pct = -1, kelvin = -1;
+    const cJSON *bj = cJSON_GetObjectItem(root, "brightness_pct");
+    if (cJSON_IsNumber(bj)) brightness_pct = bj->valueint;
+    const cJSON *kj = cJSON_GetObjectItem(root, "kelvin");
+    if (cJSON_IsNumber(kj)) kelvin = kj->valueint;
+    const cJSON *cj = cJSON_GetObjectItem(root, "color");
+    const char *color = cJSON_IsString(cj) ? cj->valuestring : NULL;
+
+    cJSON *action_arr = build_ha_action_array(&entity, dev_action_j->valuestring,
+                                              brightness_pct, kelvin, color);
+    if (!action_arr) {
+        char msg[200];
+        snprintf(msg, sizeof(msg),
+                 "%s은(는) 해당 동작을 지원하지 않습니다 (action=%s).",
+                 entity.friendly_name, dev_action_j->valuestring);
+        emit_auto_failure(output, output_size, msg);
+        return ESP_OK;
+    }
+
+    cJSON *trigger_arr = NULL, *condition_arr = NULL;
+    char err_msg[160];
+    if (build_ha_trigger_array(trigger_in, &trigger_arr, &condition_arr,
+                               err_msg, sizeof(err_msg)) != ESP_OK) {
+        emit_auto_failure(output, output_size, err_msg);
+        cJSON_Delete(action_arr);
+        return ESP_OK;
+    }
+
+    cJSON *config = cJSON_CreateObject();
+    cJSON_AddStringToObject(config, "alias",
+                            (cJSON_IsString(alias_j) && alias_j->valuestring[0])
+                            ? alias_j->valuestring
+                            : entity.friendly_name);
+    cJSON_AddItemToObject(config, "trigger", trigger_arr);
+    if (condition_arr) cJSON_AddItemToObject(config, "condition", condition_arr);
+    cJSON_AddItemToObject(config, "action", action_arr);
+    cJSON_AddStringToObject(config, "mode", "single");
+
+    char auto_id[64];
+    snprintf(auto_id, sizeof(auto_id), "esp_claw_%lld",
+             esp_timer_get_time() / 1000000);
+
+    char *config_str = cJSON_PrintUnformatted(config);
+    cJSON_Delete(config);
+    if (!config_str) {
+        emit_auto_failure(output, output_size, "내부 오류 (config 직렬화 실패).");
+        return ESP_OK;
+    }
+
+    char http_resp[1024];
+    int http_status = 0;
+    esp_err_t err = cap_ha_http_put_automation_config(auto_id, config_str,
+                                                     &http_status, http_resp,
+                                                     sizeof(http_resp));
+    free(config_str);
+    if (err != ESP_OK || http_status / 100 != 2) {
+        char msg[200];
+        cap_ha_compose_failure_message(http_status, err, msg, sizeof(msg));
+        emit_auto_failure(output, output_size, msg);
+        return ESP_OK;
+    }
+
+    int reload_status = 0;
+    char reload_resp[256];
+    cap_ha_http_reload_automations(&reload_status, reload_resp, sizeof(reload_resp));
+    if (reload_status / 100 != 2) {
+        ESP_LOGW(TAG, "automation create succeeded but reload returned %d", reload_status);
+    }
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "success", true);
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "'%s' %s 자동화를 등록했습니다 (ID: automation.%s). HA UI에서 확인 가능합니다.",
+             entity.friendly_name, dev_action_j->valuestring, auto_id);
+    cJSON_AddStringToObject(resp, "message", msg);
+    cJSON_AddStringToObject(resp, "automation_id", auto_id);
+    cJSON_AddStringToObject(resp, "entity_id", auto_id);
+    cJSON_AddNumberToObject(resp, "raw_status", http_status);
+    char *s = cJSON_PrintUnformatted(resp);
+    if (s) { snprintf(output, output_size, "%s", s); free(s); }
+    cJSON_Delete(resp);
+    return ESP_OK;
+}
+
 esp_err_t cap_ha_automation_execute(const char *input_json,
                                     char *output_json,
                                     size_t output_size)
@@ -210,12 +332,15 @@ esp_err_t cap_ha_automation_execute(const char *input_json,
         return ESP_OK;
     }
 
-    /* stub — 다음 task에서 분기 채움 */
+    esp_err_t r;
+    if (strcmp(action, "create") == 0) {
+        r = do_create(root, output_json, output_size);
+        cJSON_Delete(root);
+        return r;
+    }
+
     emit_auto_failure(output_json, output_size,
-                      "ha_automation 미구현 (stub — 다음 task에서 채움).");
+                      "이 action은 다음 단계에서 구현됩니다 (Task 6.5/6.6).");
     cJSON_Delete(root);
-    /* Mark builders as used until Task 6.4 wires them in. */
-    (void)build_ha_action_array;
-    (void)build_ha_trigger_array;
     return ESP_OK;
 }
