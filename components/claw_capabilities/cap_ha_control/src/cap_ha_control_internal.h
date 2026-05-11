@@ -87,6 +87,10 @@ esp_err_t cap_ha_http_put_automation_config(const char *id,
                                             int *http_status_out,
                                             char *response_buf,
                                             size_t response_buf_size);
+esp_err_t cap_ha_http_get_automation_config(const char *id,
+                                            int *http_status_out,
+                                            char *response_buf,
+                                            size_t response_buf_size);
 esp_err_t cap_ha_http_delete_automation_config(const char *id,
                                                int *http_status_out,
                                                char *response_buf,

@@ -450,6 +450,175 @@ static esp_err_t do_disable(const cJSON *root, char *out, size_t size) {
     return do_service(root, "turn_off", "'%s' 자동화를 비활성화했습니다.", out, size);
 }
 
+static esp_err_t do_update(const cJSON *root, char *output, size_t output_size)
+{
+    const cJSON *id_j = cJSON_GetObjectItem(root, "automation_id");
+    if (!cJSON_IsString(id_j)) {
+        emit_auto_failure(output, output_size, "automation_id가 필요합니다.");
+        return ESP_OK;
+    }
+    const char *id = id_j->valuestring;
+    if (strncmp(id, "automation.", 11) == 0) id += 11;
+
+    char existing[2048];
+    int http_status = 0;
+    esp_err_t err = cap_ha_http_get_automation_config(id, &http_status,
+                                                     existing, sizeof(existing));
+    if (err != ESP_OK || http_status / 100 != 2) {
+        char msg[200];
+        if (http_status == 404) {
+            snprintf(msg, sizeof(msg),
+                     "자동화 '%s'를 찾을 수 없습니다. 먼저 create로 등록하세요.", id);
+        } else {
+            cap_ha_compose_failure_message(http_status, err, msg, sizeof(msg));
+        }
+        emit_auto_failure(output, output_size, msg);
+        return ESP_OK;
+    }
+
+    cJSON *cfg = cJSON_Parse(existing);
+    if (!cJSON_IsObject(cfg)) {
+        if (cfg) cJSON_Delete(cfg);
+        emit_auto_failure(output, output_size, "기존 자동화 config 파싱 실패.");
+        return ESP_OK;
+    }
+
+    /* Merge: any caller-provided field overrides existing. */
+    const cJSON *trigger_in = cJSON_GetObjectItem(root, "trigger");
+    if (cJSON_IsObject(trigger_in)) {
+        cJSON *trigger_arr = NULL, *condition_arr = NULL;
+        char err_msg[160];
+        if (build_ha_trigger_array(trigger_in, &trigger_arr, &condition_arr,
+                                   err_msg, sizeof(err_msg)) != ESP_OK) {
+            cJSON_Delete(cfg);
+            emit_auto_failure(output, output_size, err_msg);
+            return ESP_OK;
+        }
+        cJSON_DeleteItemFromObject(cfg, "trigger");
+        cJSON_AddItemToObject(cfg, "trigger", trigger_arr);
+        cJSON_DeleteItemFromObject(cfg, "condition");
+        if (condition_arr) cJSON_AddItemToObject(cfg, "condition", condition_arr);
+    }
+
+    /* target/device_action change → rebuild action[].
+     * Caller may provide either or both; if missing, fall back to the existing
+     * action[0]'s target.entity_id / service name. */
+    const cJSON *target_j = cJSON_GetObjectItem(root, "target");
+    const cJSON *dev_action_j = cJSON_GetObjectItem(root, "device_action");
+    if (cJSON_IsString(target_j) || cJSON_IsString(dev_action_j)) {
+        const char *target_name = NULL;
+        if (cJSON_IsString(target_j)) {
+            if (strncmp(target_j->valuestring, "board:", 6) == 0) {
+                cJSON_Delete(cfg);
+                emit_auto_failure(output, output_size,
+                                  "보드 자체 자동화는 v5에서 지원될 예정입니다.");
+                return ESP_OK;
+            }
+            target_name = target_j->valuestring;
+        } else {
+            /* Pull entity_id from existing action[0].target.entity_id */
+            const cJSON *existing_act = cJSON_GetObjectItem(cfg, "action");
+            if (cJSON_IsArray(existing_act) && cJSON_GetArraySize(existing_act) > 0) {
+                const cJSON *step0 = cJSON_GetArrayItem(existing_act, 0);
+                const cJSON *tgt = cJSON_GetObjectItem(step0, "target");
+                const cJSON *eid = cJSON_GetObjectItem(tgt, "entity_id");
+                if (cJSON_IsString(eid)) target_name = eid->valuestring;
+            }
+        }
+
+        const char *dev_action = NULL;
+        if (cJSON_IsString(dev_action_j)) {
+            dev_action = dev_action_j->valuestring;
+        } else {
+            /* Pull from existing action[0].service ("light.turn_on" → "turn_on"). */
+            const cJSON *existing_act = cJSON_GetObjectItem(cfg, "action");
+            if (cJSON_IsArray(existing_act) && cJSON_GetArraySize(existing_act) > 0) {
+                const cJSON *step0 = cJSON_GetArrayItem(existing_act, 0);
+                const cJSON *svc = cJSON_GetObjectItem(step0, "service");
+                if (cJSON_IsString(svc)) {
+                    const char *dot = strchr(svc->valuestring, '.');
+                    if (dot) dev_action = dot + 1;
+                }
+            }
+        }
+
+        if (!target_name || !dev_action) {
+            cJSON_Delete(cfg);
+            emit_auto_failure(output, output_size,
+                              "기존 action 정보가 부족해 target/device_action 추론 실패.");
+            return ESP_OK;
+        }
+
+        cap_ha_entity_t entity = {0};
+        if (cap_ha_resolve_target(target_name, &entity) != ESP_OK) {
+            cJSON_Delete(cfg);
+            char msg[200];
+            snprintf(msg, sizeof(msg), "\"%s\"에 해당하는 기기를 찾지 못했습니다.", target_name);
+            emit_auto_failure(output, output_size, msg);
+            return ESP_OK;
+        }
+
+        int brightness_pct = -1, kelvin = -1;
+        const cJSON *bj = cJSON_GetObjectItem(root, "brightness_pct");
+        if (cJSON_IsNumber(bj)) brightness_pct = bj->valueint;
+        const cJSON *kj = cJSON_GetObjectItem(root, "kelvin");
+        if (cJSON_IsNumber(kj)) kelvin = kj->valueint;
+        const cJSON *cj = cJSON_GetObjectItem(root, "color");
+        const char *color = cJSON_IsString(cj) ? cj->valuestring : NULL;
+
+        cJSON *new_action = build_ha_action_array(&entity, dev_action,
+                                                  brightness_pct, kelvin, color);
+        if (!new_action) {
+            cJSON_Delete(cfg);
+            char msg[200];
+            snprintf(msg, sizeof(msg),
+                     "%s은(는) 해당 동작을 지원하지 않습니다 (action=%s).",
+                     entity.friendly_name, dev_action);
+            emit_auto_failure(output, output_size, msg);
+            return ESP_OK;
+        }
+        cJSON_DeleteItemFromObject(cfg, "action");
+        cJSON_AddItemToObject(cfg, "action", new_action);
+    }
+
+    const cJSON *alias_j = cJSON_GetObjectItem(root, "alias");
+    if (cJSON_IsString(alias_j)) {
+        cJSON_DeleteItemFromObject(cfg, "alias");
+        cJSON_AddStringToObject(cfg, "alias", alias_j->valuestring);
+    }
+
+    char *config_str = cJSON_PrintUnformatted(cfg);
+    cJSON_Delete(cfg);
+    if (!config_str) {
+        emit_auto_failure(output, output_size, "내부 오류 (config 직렬화 실패).");
+        return ESP_OK;
+    }
+
+    char http_resp[256];
+    err = cap_ha_http_put_automation_config(id, config_str, &http_status,
+                                            http_resp, sizeof(http_resp));
+    free(config_str);
+    if (err != ESP_OK || http_status / 100 != 2) {
+        char msg[200];
+        cap_ha_compose_failure_message(http_status, err, msg, sizeof(msg));
+        emit_auto_failure(output, output_size, msg);
+        return ESP_OK;
+    }
+    int rs = 0; cap_ha_http_reload_automations(&rs, http_resp, sizeof(http_resp));
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "success", true);
+    char msg[200];
+    snprintf(msg, sizeof(msg), "자동화 'automation.%s'를 업데이트했습니다.", id);
+    cJSON_AddStringToObject(resp, "message", msg);
+    cJSON_AddStringToObject(resp, "automation_id", id);
+    cJSON_AddNumberToObject(resp, "raw_status", http_status);
+    char *s = cJSON_PrintUnformatted(resp);
+    if (s) { snprintf(output, output_size, "%s", s); free(s); }
+    cJSON_Delete(resp);
+    return ESP_OK;
+}
+
 esp_err_t cap_ha_automation_execute(const char *input_json,
                                     char *output_json,
                                     size_t output_size)
@@ -478,10 +647,7 @@ esp_err_t cap_ha_automation_execute(const char *input_json,
     else if (strcmp(action, "trigger_now") == 0)  r = do_trigger_now(root, output_json, output_size);
     else if (strcmp(action, "enable") == 0)       r = do_enable(root, output_json, output_size);
     else if (strcmp(action, "disable") == 0)      r = do_disable(root, output_json, output_size);
-    else if (strcmp(action, "update") == 0) {
-        emit_auto_failure(output_json, output_size,
-                          "update는 다음 task에서 구현됩니다.");
-    } else {
+    else if (strcmp(action, "update") == 0)       r = do_update(root, output_json, output_size); else {
         emit_auto_failure(output_json, output_size,
                           "내부 오류 (action validation은 통과했으나 dispatch가 누락됨).");
     }
