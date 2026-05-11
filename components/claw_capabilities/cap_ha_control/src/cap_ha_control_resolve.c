@@ -27,6 +27,42 @@ static bool supports_array_has(const cJSON *arr, const char *needle)
     return false;
 }
 
+static void normalize_korean(const char *in, char *out, size_t out_size)
+{
+    if (!in || !out || out_size == 0) { if (out && out_size) out[0] = '\0'; return; }
+    size_t len = strlen(in);
+    /* Strip ASCII whitespace anywhere. */
+    size_t w = 0;
+    for (size_t i = 0; i < len && w + 1 < out_size; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == ' ' || c == '\t') continue;
+        out[w++] = (char)c;
+    }
+    out[w] = '\0';
+
+    /* Drop a trailing 1-syllable Korean particle (등/의/은/는/이/가/을/를/도) if
+     * the string ends with one. UTF-8 of these particles is 3 bytes each. */
+    static const char *trailing_particles[] = {
+        "\xeb\x93\xb1", /* 등 */
+        "\xec\x9d\x98", /* 의 */
+        "\xec\x9d\x80", /* 은 */
+        "\xeb\x8a\x94", /* 는 */
+        "\xec\x9d\xb4", /* 이 */
+        "\xea\xb0\x80", /* 가 */
+        "\xec\x9d\x84", /* 을 */
+        "\xeb\xa5\xbc", /* 를 */
+        "\xeb\x8f\x84", /* 도 */
+    };
+    if (w >= 3) {
+        for (size_t k = 0; k < sizeof(trailing_particles) / sizeof(trailing_particles[0]); k++) {
+            if (memcmp(out + w - 3, trailing_particles[k], 3) == 0) {
+                out[w - 3] = '\0';
+                return;
+            }
+        }
+    }
+}
+
 static esp_err_t parse_registry(const char *json_str, cap_ha_registry_t *out)
 {
     cJSON *root = cJSON_Parse(json_str);
@@ -94,8 +130,36 @@ esp_err_t cap_ha_resolve_init(void)
 
 esp_err_t cap_ha_resolve_target(const char *target, cap_ha_entity_t *out)
 {
-    (void)target; (void)out;
-    /* Real cascade lands in Task 5. */
+    if (!target || !*target || !out) return ESP_ERR_INVALID_ARG;
+    if (s_static_registry.count == 0) return ESP_ERR_NOT_FOUND;
+
+    /* Stage 1: exact entity_id match. */
+    for (size_t i = 0; i < s_static_registry.count; i++) {
+        if (strcmp(s_static_registry.items[i].id, target) == 0) {
+            *out = s_static_registry.items[i];
+            return ESP_OK;
+        }
+    }
+    /* Stage 2: exact friendly_name match. */
+    for (size_t i = 0; i < s_static_registry.count; i++) {
+        if (strcmp(s_static_registry.items[i].friendly_name, target) == 0) {
+            *out = s_static_registry.items[i];
+            return ESP_OK;
+        }
+    }
+    /* Stage 3: normalized friendly_name match. */
+    char target_norm[64];
+    normalize_korean(target, target_norm, sizeof(target_norm));
+    if (target_norm[0] == '\0') return ESP_ERR_NOT_FOUND;
+    for (size_t i = 0; i < s_static_registry.count; i++) {
+        char fn_norm[64];
+        normalize_korean(s_static_registry.items[i].friendly_name,
+                         fn_norm, sizeof(fn_norm));
+        if (fn_norm[0] && strcmp(fn_norm, target_norm) == 0) {
+            *out = s_static_registry.items[i];
+            return ESP_OK;
+        }
+    }
     return ESP_ERR_NOT_FOUND;
 }
 
