@@ -69,6 +69,27 @@ esp_err_t cap_ha_http_set_token(const char *token)
     return err;
 }
 
+esp_err_t cap_ha_http_set_insecure(bool insecure)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(CAP_HA_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(h, CAP_HA_NVS_KEY_INSECURE, insecure ? 1 : 0);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+bool cap_ha_http_get_insecure(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(CAP_HA_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
+    uint8_t v = 0;
+    nvs_get_u8(h, CAP_HA_NVS_KEY_INSECURE, &v);
+    nvs_close(h);
+    return v != 0;
+}
+
 typedef struct {
     char *data;
     size_t len;
@@ -139,6 +160,11 @@ esp_err_t cap_ha_http_post_service(const char *domain, const char *service,
     cap_ha_buf_t resp = {
         .data = response_buf, .len = 0, .cap = response_buf_size,
     };
+    bool is_https = (strncmp(full_url, "https://", 8) == 0);
+    bool insecure = is_https && cap_ha_http_get_insecure();
+    if (insecure) {
+        ESP_LOGW(TAG, "TLS verification disabled (--set-insecure on) — token sent over insecure HTTPS");
+    }
     esp_http_client_config_t cfg = {
         .url = full_url,
         .method = HTTP_METHOD_POST,
@@ -146,7 +172,8 @@ esp_err_t cap_ha_http_post_service(const char *domain, const char *service,
         .user_data = &resp,
         .timeout_ms = CAP_HA_HTTP_TIMEOUT_MS,
         .buffer_size = 2048,
-        .crt_bundle_attach = esp_crt_bundle_attach,
+        .crt_bundle_attach = (is_https && !insecure) ? esp_crt_bundle_attach : NULL,
+        .skip_cert_common_name_check = insecure,
     };
     esp_http_client_handle_t cli = esp_http_client_init(&cfg);
     if (!cli) { free(auth_header); return ESP_ERR_NO_MEM; }
@@ -202,6 +229,11 @@ esp_err_t cap_ha_http_get_states(char *response_buf, size_t response_buf_size)
     cap_ha_buf_t resp = {
         .data = response_buf, .len = 0, .cap = response_buf_size,
     };
+    bool is_https = (strncmp(full_url, "https://", 8) == 0);
+    bool insecure = is_https && cap_ha_http_get_insecure();
+    if (insecure) {
+        ESP_LOGW(TAG, "TLS verification disabled (--set-insecure on) — token sent over insecure HTTPS");
+    }
     esp_http_client_config_t cfg = {
         .url = full_url,
         .method = HTTP_METHOD_GET,
@@ -209,7 +241,8 @@ esp_err_t cap_ha_http_get_states(char *response_buf, size_t response_buf_size)
         .user_data = &resp,
         .timeout_ms = CAP_HA_HTTP_TIMEOUT_MS,
         .buffer_size = 2048,
-        .crt_bundle_attach = esp_crt_bundle_attach,
+        .crt_bundle_attach = (is_https && !insecure) ? esp_crt_bundle_attach : NULL,
+        .skip_cert_common_name_check = insecure,
     };
     esp_http_client_handle_t cli = esp_http_client_init(&cfg);
     if (!cli) { free(auth_header); return ESP_ERR_NO_MEM; }

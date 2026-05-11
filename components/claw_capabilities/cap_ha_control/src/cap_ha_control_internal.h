@@ -14,6 +14,7 @@
 #define CAP_HA_NVS_KEY_URL         "ha_url"
 #define CAP_HA_NVS_KEY_TOKEN       "ha_token"
 #define CAP_HA_NVS_KEY_CACHE       "entity_cache"
+#define CAP_HA_NVS_KEY_INSECURE    "ha_insecure"  /* bool: skip TLS cert verify */
 
 #define CAP_HA_HTTP_TIMEOUT_MS     8000
 
@@ -68,6 +69,8 @@ esp_err_t cap_ha_http_get_url(char *url_out, size_t url_size);
 esp_err_t cap_ha_http_get_token(char *token_out, size_t token_size);
 esp_err_t cap_ha_http_set_url(const char *url);
 esp_err_t cap_ha_http_set_token(const char *token);
+esp_err_t cap_ha_http_set_insecure(bool insecure);
+bool cap_ha_http_get_insecure(void);
 
 /* board */
 esp_err_t cap_ha_board_dispatch(const char *target,
