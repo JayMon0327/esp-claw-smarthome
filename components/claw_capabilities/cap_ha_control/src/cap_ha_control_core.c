@@ -15,6 +15,7 @@ esp_err_t cap_ha_core_execute(const char *input_json,
                               size_t output_size)
 {
     (void)input_json;
+    if (!output_json || output_size == 0) return ESP_ERR_INVALID_ARG;
     ESP_LOGW(TAG, "stub: ha_control not yet implemented");
     snprintf(output_json, output_size,
              "{\"success\":false,\"message\":\"ha_control not yet implemented (stub).\"}");

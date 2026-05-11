@@ -16,6 +16,7 @@ esp_err_t cap_ha_board_dispatch(const char *target, const char *action,
 {
     (void)target; (void)action; (void)brightness_pct; (void)color;
     (void)TAG;
+    if (!message_out || message_size == 0) return ESP_ERR_INVALID_ARG;
     snprintf(message_out, message_size, "보드 RGB 분기 미구현 (stub).");
     return ESP_ERR_NOT_SUPPORTED;
 }
