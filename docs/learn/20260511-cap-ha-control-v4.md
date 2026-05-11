@@ -27,6 +27,7 @@
 | `607caec` | 6.5 remove/list/trigger_now/enable/disable | `do_remove` (DELETE + reload), `do_list` (GET /api/states + filter `automation.*` + `esp_claw_managed` flag via substring), `do_service` helper + 3 wrappers (`trigger`/`turn_on`/`turn_off`). 모든 핸들러 `automation.` prefix를 strip + 다시 prepend하는 normalize 패턴. |
 | `8dbf0df` | 6.6 update | GET-merge-PUT. `cap_ha_http_get_automation_config` HTTP helper 추가. 404면 "먼저 create로 등록하세요". 누락 필드는 caller가 안 보내면 기존 cfg의 `action[0].target.entity_id` / `action[0].service` 의 `.` 뒤 부분을 fallback. board:* reject 동일. |
 | `c9050db` | 6.7 console `--automation` | `cmd_cap_ha_control.c`에 `arg_str0` + dispatch. `cap_ha_automation_execute(json, output, sizeof(output))` 직접 호출. `arg_end(3) → arg_end(4)`. |
+| `c04c845` | post-flash fix | 보드 검증에서 발견된 2개 demo-blocker 버그 (아래 "v3 ship 사이클 학습 재확인" 섹션 참조). |
 
 ## 무엇을 배웠나
 
@@ -59,6 +60,33 @@ Task 6.2에서 `s_ha_automation_description[768]`이 estimated 413+256 byte inte
 Option B (HA REST 위임)의 trade-off로 board-only 자동화는 v4에서 명시적 reject. Task 6.4의 `do_create`가 `target=board:*` 도 reject, 어떤 entity로 resolve되어도 `domain=board` 면 reject. v5에서 cap_scheduler 추가로 보드 자체 자동화 지원 예정.
 
 **원칙:** Scope cut을 architecture로 명시적 처리 (reject + 명확한 v5 메시지). LLM이 reject 메시지 verbatim echo → 사용자에게 "왜 안되는지" + "언제 가능한지" 동시 전달.
+
+## v3 ship 사이클 학습 재확인 — 보드 검증에서만 발견되는 외부 시스템 의존 버그
+
+v3 ship 학습 ("plan-review 2 라운드 + spec/code review 통과 후에도 on-board 검증에서 critical bug")가 v4에서도 그대로 재현됐다. v4 plan-time에 HA endpoint 응답 schema를 직접 curl로 검증했음에도, 두 개의 demo-blocker가 처음 실 보드 + 실 HA 통합 시점에 드러났다.
+
+### Bug 1 — HA modern schema: `trigger` → `triggers` (plural)
+
+- 증상: `update` 시 HA 400 `"Cannot specify both 'trigger' and 'triggers'"`.
+- 원인: HA 2024.x+ 가 config 내부 저장을 plural 키로 정규화. POST는 둘 다 받지만, GET는 plural 만 반환. 우리 `do_update` 는 `DeleteItem("trigger")` (no-op, 존재 안 함) + `AddItem("trigger", new)` → 결과적으로 양쪽 키 모두 PUT body에 들어감.
+- 수정 (`c04c845`): config object에 추가할 때 모두 plural 키 사용 (`triggers`/`actions`/`conditions`). update merge에서는 singular+plural 둘 다 delete 후 plural add. fallback action[0] 파싱도 plural 우선 → singular 폴백. action service 필드도 `service` / 모던 `action` 둘 다 인식.
+
+### Bug 2 — HA가 alias 슬러그로 entity_id 생성 → trigger/enable/disable silent no-op
+
+- 증상: `automation_id: esp_claw_115` + `alias: "v4-update-debug"` 로 등록한 자동화에 대해 `automation.trigger {entity_id: "automation.esp_claw_115"}` 호출 → HA 200 응답이지만 실제로 발화 안 됨. HA UI에서 자동화는 `automation.v4_update_debug` 로 노출.
+- 원인: HA는 config의 `id` 필드는 내부 storage 키로만 사용하고, runtime entity_id 는 `alias` 슬러그에서 계산. 우리 firmware는 "URL id == entity local id" 라고 가정 (틀림). 게다가 HA service 호출은 잘못된 entity_id에도 silently 200 반환 → 디버깅 어려움.
+- 수정 (`c04c845`): `resolve_entity_id_by_config_id(config_id, out_entity_id)` 헬퍼 추가 (GET /api/states + `attributes.id == config_id` 매칭). do_create 응답은 이제 `{automation_id: esp_claw_X, entity_id: automation.<actual_slug>}` 양쪽 다 반환. do_service (trigger/enable/disable) 는 호출 전에 resolver로 실 entity_id 확보. do_list 의 `esp_claw_managed` 분류는 `attributes.id` 의 `esp_claw_` 접두 검사로 변경 (이전 substring 매치는 잘못된 entity_id를 봐서 항상 0).
+
+### 두 버그가 plan-review에서 안 잡힌 이유
+
+- Bug 1: plan-time에 POST 만 curl 로 검증, GET-merge-PUT 사이클은 안 돌려봤음. POST는 singular/plural 둘 다 수용해 "동작 확인"이 정상 케이스로 받아들여졌다.
+- Bug 2: plan-time에 `/api/services/automation/trigger` curl 검증이 "200 응답" 만 확인했지 실제 자동화가 발화했는지 확인 안 했음. HA의 silent-no-op 정책이 false positive 만듦.
+
+### 원칙 (v3 학습 재강조)
+
+- 외부 시스템 통합 시 **happy-path 응답 코드 ≠ 실제 동작**. HA service 호출이 200 반환해도 entity_id 가 잘못되면 no-op. 실제 effect (lamp turn_off 발화) 까지 chain end-to-end 검증 필요.
+- API 응답 schema는 plan-time GET 한 번이 아니라 **GET → mutate → PUT 사이클** 까지 돌려봐야 정규화 차이 (singular vs plural) 발견됨.
+- 향후 비슷한 작업: plan-time spike 단계에 "POST 한 번 + 그 결과를 GET 다시 + 그 응답을 PUT 다시 + 실제 어떤 entity가 변했는지" 까지 짚는 micro-E2E 필수.
 
 ## 다음에 v5에서
 
