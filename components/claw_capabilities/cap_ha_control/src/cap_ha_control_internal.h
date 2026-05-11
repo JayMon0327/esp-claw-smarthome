@@ -72,6 +72,25 @@ esp_err_t cap_ha_http_set_token(const char *token);
 esp_err_t cap_ha_http_set_insecure(bool insecure);
 bool cap_ha_http_get_insecure(void);
 
+/* HA REST automation CRUD (used by cap_ha_automation). */
+esp_err_t cap_ha_http_put_automation_config(const char *id,
+                                            const char *config_json,
+                                            int *http_status_out,
+                                            char *response_buf,
+                                            size_t response_buf_size);
+esp_err_t cap_ha_http_delete_automation_config(const char *id,
+                                               int *http_status_out,
+                                               char *response_buf,
+                                               size_t response_buf_size);
+esp_err_t cap_ha_http_reload_automations(int *http_status_out,
+                                         char *response_buf,
+                                         size_t response_buf_size);
+esp_err_t cap_ha_http_call_automation_service(const char *service,
+                                              const char *entity_id,
+                                              int *http_status_out,
+                                              char *response_buf,
+                                              size_t response_buf_size);
+
 /* board */
 esp_err_t cap_ha_board_dispatch(const char *target,
                                 const char *action,
