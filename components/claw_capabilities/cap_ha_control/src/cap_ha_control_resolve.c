@@ -9,6 +9,7 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
@@ -22,6 +23,9 @@ extern const char entities_default_json_end[]   asm("_binary_entities_default_js
 
 static cap_ha_registry_t s_static_registry = {0};
 static cap_ha_registry_t s_cache_registry = {0};
+/* s_cache_mutex guards s_cache_registry. s_static_registry is write-once
+ * at init and read-only afterwards; no mutex needed. */
+static SemaphoreHandle_t s_cache_mutex = NULL;
 
 #if CONFIG_CAP_HA_CONTROL_BOOT_FETCH_ENABLED
 static void boot_fetch_task(void *arg);
@@ -164,6 +168,10 @@ static esp_err_t store_cache_to_nvs(const char *json_blob)
 
 esp_err_t cap_ha_resolve_init(void)
 {
+    if (!s_cache_mutex) {
+        s_cache_mutex = xSemaphoreCreateMutex();
+        if (!s_cache_mutex) return ESP_ERR_NO_MEM;
+    }
     size_t len = (size_t)(entities_default_json_end - entities_default_json_start);
     char *buf = malloc(len + 1);
     if (!buf) return ESP_ERR_NO_MEM;
@@ -208,13 +216,28 @@ esp_err_t cap_ha_resolve_target(const char *target, cap_ha_entity_t *out)
     if (!target || !*target || !out) return ESP_ERR_INVALID_ARG;
     /* Stage 1: exact entity_id (static first, then cache). */
     if (lookup_in(&s_static_registry, target, true, false, false, out)) return ESP_OK;
-    if (lookup_in(&s_cache_registry,  target, true, false, false, out)) return ESP_OK;
+    {
+        xSemaphoreTake(s_cache_mutex, portMAX_DELAY);
+        bool found = lookup_in(&s_cache_registry, target, true, false, false, out);
+        xSemaphoreGive(s_cache_mutex);
+        if (found) return ESP_OK;
+    }
     /* Stage 2: exact friendly_name. */
     if (lookup_in(&s_static_registry, target, false, true, false, out)) return ESP_OK;
-    if (lookup_in(&s_cache_registry,  target, false, true, false, out)) return ESP_OK;
+    {
+        xSemaphoreTake(s_cache_mutex, portMAX_DELAY);
+        bool found = lookup_in(&s_cache_registry, target, false, true, false, out);
+        xSemaphoreGive(s_cache_mutex);
+        if (found) return ESP_OK;
+    }
     /* Stage 3: normalized friendly_name. */
     if (lookup_in(&s_static_registry, target, false, false, true, out)) return ESP_OK;
-    if (lookup_in(&s_cache_registry,  target, false, false, true, out)) return ESP_OK;
+    {
+        xSemaphoreTake(s_cache_mutex, portMAX_DELAY);
+        bool found = lookup_in(&s_cache_registry, target, false, false, true, out);
+        xSemaphoreGive(s_cache_mutex);
+        if (found) return ESP_OK;
+    }
     return ESP_ERR_NOT_FOUND;
 }
 
@@ -224,10 +247,10 @@ esp_err_t cap_ha_resolve_top_candidates(char *out_csv, size_t out_size, size_t m
     out_csv[0] = '\0';
     size_t emitted = 0;
 
+    xSemaphoreTake(s_cache_mutex, portMAX_DELAY);
     cap_ha_registry_t *regs[2] = { &s_static_registry, &s_cache_registry };
     for (int r = 0; r < 2 && emitted < max; r++) {
         for (size_t i = 0; i < regs[r]->count && emitted < max; i++) {
-            /* dedupe by id against already-included static entries */
             if (r == 1 && registry_has_id(&s_static_registry, regs[r]->items[i].id)) continue;
             const char *sep = (emitted == 0) ? "" : ", ";
             size_t cur = strlen(out_csv);
@@ -238,6 +261,7 @@ esp_err_t cap_ha_resolve_top_candidates(char *out_csv, size_t out_size, size_t m
         }
     }
 done:
+    xSemaphoreGive(s_cache_mutex);
     if (emitted == 0) snprintf(out_csv, out_size, "(none)");
     return ESP_OK;
 }
@@ -309,9 +333,11 @@ esp_err_t cap_ha_resolve_refresh_from_ha(void)
     if (!blob) return ESP_ERR_NO_MEM;
     esp_err_t store_err = store_cache_to_nvs(blob);
     if (store_err == ESP_OK) {
+        xSemaphoreTake(s_cache_mutex, portMAX_DELAY);
         if (s_cache_registry.items) free(s_cache_registry.items);
         s_cache_registry = (cap_ha_registry_t){0};
         parse_registry(blob, &s_cache_registry);
+        xSemaphoreGive(s_cache_mutex);
     }
     ESP_LOGI(TAG, "boot-fetch: kept %d entities, NVS store=%s",
              kept, esp_err_to_name(store_err));
