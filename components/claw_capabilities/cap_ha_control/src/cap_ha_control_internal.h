@@ -45,6 +45,10 @@ esp_err_t cap_ha_core_execute(const char *input_json,
                               char *output_json,
                               size_t output_size);
 
+esp_err_t cap_ha_automation_execute(const char *input_json,
+                                    char *output_json,
+                                    size_t output_size);
+
 /* resolve */
 esp_err_t cap_ha_resolve_init(void);
 esp_err_t cap_ha_resolve_target(const char *target,

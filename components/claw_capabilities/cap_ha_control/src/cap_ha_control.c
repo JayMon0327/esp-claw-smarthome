@@ -15,6 +15,7 @@ static const char *TAG = "cap_ha_control";
 
 static char s_ha_description[1024];
 static char s_ha_friendly_names[256];
+static char s_ha_automation_description[1024];
 
 static esp_err_t cap_ha_execute(const char *input_json,
                                 const claw_cap_call_context_t *ctx,
@@ -23,6 +24,15 @@ static esp_err_t cap_ha_execute(const char *input_json,
 {
     (void)ctx;
     return cap_ha_core_execute(input_json, output, output_size);
+}
+
+static esp_err_t cap_ha_automation_execute_wrapper(const char *input_json,
+                                                   const claw_cap_call_context_t *ctx,
+                                                   char *output,
+                                                   size_t output_size)
+{
+    (void)ctx;
+    return cap_ha_automation_execute(input_json, output, output_size);
 }
 
 static claw_cap_descriptor_t s_ha_descriptors[] = {
@@ -45,6 +55,34 @@ static claw_cap_descriptor_t s_ha_descriptors[] = {
             "\"required\":[\"target\",\"action\"]}",
         .execute = cap_ha_execute,
     },
+    {
+        .id = "ha_automation",
+        .name = "ha_automation",
+        .family = "ha",
+        .description = NULL, /* set in cap_ha_compose_description */
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{"
+              "\"action\":{\"type\":\"string\",\"enum\":[\"create\",\"update\",\"remove\",\"list\",\"trigger_now\",\"enable\",\"disable\"]},"
+              "\"automation_id\":{\"type\":\"string\",\"description\":\"HA entity local id (without 'automation.' prefix). create assigns automatically (esp_claw_<ts>).\"},"
+              "\"alias\":{\"type\":\"string\",\"description\":\"Human-readable name visible in HA UI.\"},"
+              "\"trigger\":{\"type\":\"object\",\"properties\":{"
+                "\"kind\":{\"type\":\"string\",\"enum\":[\"daily_time\",\"weekly\",\"interval\"]},"
+                "\"time\":{\"type\":\"string\",\"description\":\"daily_time/weekly: 'HH:MM' 24h KST\"},"
+                "\"weekdays\":{\"type\":\"array\",\"items\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":6},\"description\":\"weekly: 0=Sunday\"},"
+                "\"interval_ms\":{\"type\":\"integer\",\"minimum\":2000}"
+              "}},"
+              "\"target\":{\"type\":\"string\",\"description\":\"HA entity friendly name or entity_id. board:* targets are not supported in v4 (HA-side automation only).\"},"
+              "\"device_action\":{\"type\":\"string\",\"enum\":[\"turn_on\",\"turn_off\",\"toggle\",\"open\",\"close\"]},"
+              "\"brightness_pct\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100},"
+              "\"color\":{\"type\":\"string\"},"
+              "\"kelvin\":{\"type\":\"integer\",\"minimum\":2000,\"maximum\":6500}"
+            "},"
+            "\"required\":[\"action\"]}",
+        .execute = cap_ha_automation_execute_wrapper,
+    },
 };
 
 void cap_ha_compose_description(void)
@@ -58,6 +96,16 @@ void cap_ha_compose_description(void)
              "Do not invent confirmation messages.",
              s_ha_friendly_names);
     s_ha_descriptors[0].description = s_ha_description;
+
+    snprintf(s_ha_automation_description, sizeof(s_ha_automation_description),
+             "Register/modify/remove time-based automations on Home Assistant. "
+             "Active devices (use these names verbatim in 'target'): %s. "
+             "board:* targets (onboard RGB) are NOT supported here — those would require on-device automation, planned for v5. "
+             "Use 'create' (assigns automation_id), 'update' (needs automation_id), 'remove' (needs automation_id), "
+             "'list' (returns existing automations), 'trigger_now' (force-fire by id), 'enable'/'disable' (toggle by id). "
+             "After this tool returns, respond to the user with the result 'message' field VERBATIM.",
+             s_ha_friendly_names);
+    s_ha_descriptors[1].description = s_ha_automation_description;
 }
 
 /* claw_cap_lifecycle_fn = esp_err_t (*)(void) — see claw_cap.h. No params. */
