@@ -128,8 +128,12 @@ esp_err_t cap_ha_http_post_service(const char *domain, const char *service,
     snprintf(full_url, sizeof(full_url), "%s/api/services/%s/%s",
              base_url, domain, service);
 
-    char auth_header[4128];
-    snprintf(auth_header, sizeof(auth_header), "Bearer %s", token);
+    /* Auth header on heap — token can be 4KB; stack-resident would blow
+     * the boot-fetch task's 6KB stack (Backtrace: |<-CORRUPTED 확인됨). */
+    size_t auth_len = strlen(token) + 16;
+    char *auth_header = malloc(auth_len);
+    if (!auth_header) { free(token); return ESP_ERR_NO_MEM; }
+    snprintf(auth_header, auth_len, "Bearer %s", token);
     free(token);
 
     cap_ha_buf_t resp = {
@@ -145,7 +149,7 @@ esp_err_t cap_ha_http_post_service(const char *domain, const char *service,
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_http_client_handle_t cli = esp_http_client_init(&cfg);
-    if (!cli) return ESP_ERR_NO_MEM;
+    if (!cli) { free(auth_header); return ESP_ERR_NO_MEM; }
     esp_http_client_set_header(cli, "Content-Type", "application/json");
     esp_http_client_set_header(cli, "Accept", "application/json");
     esp_http_client_set_header(cli, "Connection", "close");
@@ -157,6 +161,7 @@ esp_err_t cap_ha_http_post_service(const char *domain, const char *service,
     int status = esp_http_client_get_status_code(cli);
     if (http_status_out) *http_status_out = status;
     esp_http_client_cleanup(cli);
+    free(auth_header);
     ESP_LOGI(TAG, "POST result err=%s status=%d resp_len=%zu",
              esp_err_to_name(err), status, resp.len);
     /* Contract: ESP_OK == HTTP transport completed (caller checks
@@ -187,8 +192,11 @@ esp_err_t cap_ha_http_get_states(char *response_buf, size_t response_buf_size)
 
     char full_url[256];
     snprintf(full_url, sizeof(full_url), "%s/api/states", base_url);
-    char auth_header[4128];
-    snprintf(auth_header, sizeof(auth_header), "Bearer %s", token);
+
+    size_t auth_len = strlen(token) + 16;
+    char *auth_header = malloc(auth_len);
+    if (!auth_header) { free(token); return ESP_ERR_NO_MEM; }
+    snprintf(auth_header, auth_len, "Bearer %s", token);
     free(token);
 
     cap_ha_buf_t resp = {
@@ -204,7 +212,7 @@ esp_err_t cap_ha_http_get_states(char *response_buf, size_t response_buf_size)
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_http_client_handle_t cli = esp_http_client_init(&cfg);
-    if (!cli) return ESP_ERR_NO_MEM;
+    if (!cli) { free(auth_header); return ESP_ERR_NO_MEM; }
     esp_http_client_set_header(cli, "Accept", "application/json");
     esp_http_client_set_header(cli, "Connection", "close");
     esp_http_client_set_header(cli, "Authorization", auth_header);
@@ -213,6 +221,7 @@ esp_err_t cap_ha_http_get_states(char *response_buf, size_t response_buf_size)
     err = esp_http_client_perform(cli);
     int status = esp_http_client_get_status_code(cli);
     esp_http_client_cleanup(cli);
+    free(auth_header);
     ESP_LOGI(TAG, "GET result err=%s status=%d resp_len=%zu",
              esp_err_to_name(err), status, resp.len);
     if (err != ESP_OK) return err;
