@@ -85,3 +85,6 @@ void cap_ha_compose_success_message(const cap_ha_entity_t *e,
                                     char *out, size_t out_size);
 void cap_ha_compose_failure_message(int http_status, esp_err_t http_err,
                                     char *out, size_t out_size);
+
+/* description (defined in cap_ha_control.c) */
+void cap_ha_compose_description(void);

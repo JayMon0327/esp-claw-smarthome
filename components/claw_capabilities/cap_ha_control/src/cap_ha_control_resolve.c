@@ -367,6 +367,10 @@ static void boot_fetch_task(void *arg)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "boot-fetch failed: %s (will use static-only registry)",
                  esp_err_to_name(err));
+    } else {
+        cap_ha_compose_description();
+        ESP_LOGI(TAG, "boot-fetch: description refreshed with %zu+%zu entities",
+                 s_static_registry.count, s_cache_registry.count);
     }
     vTaskDelete(NULL);
 }

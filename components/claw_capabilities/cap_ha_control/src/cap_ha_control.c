@@ -47,7 +47,7 @@ static claw_cap_descriptor_t s_ha_descriptors[] = {
     },
 };
 
-static void compose_description(void)
+void cap_ha_compose_description(void)
 {
     cap_ha_resolve_active_friendly_names(s_ha_friendly_names, sizeof(s_ha_friendly_names));
     snprintf(s_ha_description, sizeof(s_ha_description),
@@ -68,7 +68,7 @@ static esp_err_t cap_ha_group_init(void)
         ESP_LOGW(TAG, "resolve_init returned %s — using static-only registry",
                  esp_err_to_name(err));
     }
-    compose_description();
+    cap_ha_compose_description();
     err = cmd_cap_ha_control_register();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "cmd register failed: %s", esp_err_to_name(err));
