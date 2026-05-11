@@ -48,7 +48,10 @@ static const char *APP_STARTUP_EVENT_KEY = "boot_completed";
     "Use 'activate_skill' to load a skill, and you will gain more callable capabilities\n" \
     "Skills are user-facing functions, while Capabilities are internal functions used by the model.\n" \
     "After completing the task, call 'deactivate_skill' to keep the context streamlined and efficient." \
-    "When communicating with the user, refer to skills instead of Capabilities. "
+    "When communicating with the user, refer to skills instead of Capabilities. " \
+    "When a tool returns a 'message' field, respond to the user with that message verbatim — do not rephrase, do not add commentary, do not invent confirmation. " \
+    "Do not claim a tool succeeded unless its 'success' field is true. " \
+    "For smart-home control (lights, curtains, switches, the onboard RGB LED) use the 'ha_control' tool only. Never call 'mcp_call_tool' or any 'lua_*' tool to control devices."
 
 #if CONFIG_APP_CLAW_MEMORY_MODE_FULL
 #define APP_SYSTEM_PROMPT_SUFFIX \
