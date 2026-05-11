@@ -40,7 +40,7 @@ typedef struct {
 #define APP_DEFAULT_SEARCH_BRAVE_KEY      ""
 #define APP_DEFAULT_SEARCH_TAVILY_KEY     ""
 #define APP_DEFAULT_ENABLED_CAP_GROUPS    ""
-#define APP_DEFAULT_LLM_VISIBLE_CAP_GROUPS ""
+#define APP_DEFAULT_LLM_VISIBLE_CAP_GROUPS "cap_skill,cap_ha_control,cap_im_tg,cap_time,cap_system"
 #define APP_DEFAULT_ENABLED_LUA_MODULES   ""
 #define APP_DEFAULT_TIME_TIMEZONE         "CST-8"
 
