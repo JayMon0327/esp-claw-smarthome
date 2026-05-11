@@ -189,6 +189,53 @@ static esp_err_t build_ha_trigger_array(const cJSON *trigger_in,
     return ESP_OK;
 }
 
+/* Resolve an automation's CONFIG id (our esp_claw_<ts>) to its actual HA
+ * runtime entity_id (e.g., "automation.v4_update_debug"). HA derives the
+ * entity_id from the alias slug, not from the config id, so subsequent
+ * service calls (trigger/turn_on/turn_off) must use the runtime entity_id.
+ *
+ * Returns ESP_OK with *out_entity_id populated (including "automation."
+ * prefix) on match, ESP_ERR_NOT_FOUND if no entity has attributes.id ==
+ * config_id, or upstream error.
+ */
+static esp_err_t resolve_entity_id_by_config_id(const char *config_id,
+                                                char *out_entity_id,
+                                                size_t out_size)
+{
+    if (!config_id || !*config_id || !out_entity_id || out_size == 0)
+        return ESP_ERR_INVALID_ARG;
+    out_entity_id[0] = '\0';
+
+    char *states = malloc(CAP_HA_STATES_BUF_BYTES);
+    if (!states) return ESP_ERR_NO_MEM;
+    esp_err_t err = cap_ha_http_get_states(states, CAP_HA_STATES_BUF_BYTES);
+    if (err != ESP_OK) { free(states); return err; }
+
+    cJSON *arr = cJSON_Parse(states);
+    free(states);
+    if (!cJSON_IsArray(arr)) {
+        if (arr) cJSON_Delete(arr);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    esp_err_t result = ESP_ERR_NOT_FOUND;
+    cJSON *e = NULL;
+    cJSON_ArrayForEach(e, arr) {
+        const cJSON *eid = cJSON_GetObjectItemCaseSensitive(e, "entity_id");
+        if (!cJSON_IsString(eid) ||
+            strncmp(eid->valuestring, "automation.", 11) != 0) continue;
+        const cJSON *attr = cJSON_GetObjectItemCaseSensitive(e, "attributes");
+        const cJSON *id_j = cJSON_GetObjectItemCaseSensitive(attr, "id");
+        if (cJSON_IsString(id_j) && strcmp(id_j->valuestring, config_id) == 0) {
+            snprintf(out_entity_id, out_size, "%s", eid->valuestring);
+            result = ESP_OK;
+            break;
+        }
+    }
+    cJSON_Delete(arr);
+    return result;
+}
+
 static esp_err_t do_create(const cJSON *root, char *output, size_t output_size)
 {
     const cJSON *target_j = cJSON_GetObjectItem(root, "target");
@@ -259,9 +306,9 @@ static esp_err_t do_create(const cJSON *root, char *output, size_t output_size)
                             (cJSON_IsString(alias_j) && alias_j->valuestring[0])
                             ? alias_j->valuestring
                             : entity.friendly_name);
-    cJSON_AddItemToObject(config, "trigger", trigger_arr);
-    if (condition_arr) cJSON_AddItemToObject(config, "condition", condition_arr);
-    cJSON_AddItemToObject(config, "action", action_arr);
+    cJSON_AddItemToObject(config, "triggers", trigger_arr);
+    if (condition_arr) cJSON_AddItemToObject(config, "conditions", condition_arr);
+    cJSON_AddItemToObject(config, "actions", action_arr);
     cJSON_AddStringToObject(config, "mode", "single");
 
     char auto_id[64];
@@ -295,15 +342,21 @@ static esp_err_t do_create(const cJSON *root, char *output, size_t output_size)
         ESP_LOGW(TAG, "automation create succeeded but reload returned %d", reload_status);
     }
 
+    char resolved_eid[96] = {0};
+    if (resolve_entity_id_by_config_id(auto_id, resolved_eid, sizeof(resolved_eid)) != ESP_OK) {
+        snprintf(resolved_eid, sizeof(resolved_eid), "automation.%s", auto_id);
+        ESP_LOGW(TAG, "post-create entity_id lookup miss; using fallback %s", resolved_eid);
+    }
+
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "success", true);
-    char msg[256];
+    char msg[384];
     snprintf(msg, sizeof(msg),
-             "'%s' %s 자동화를 등록했습니다 (ID: automation.%s). HA UI에서 확인 가능합니다.",
-             entity.friendly_name, dev_action_j->valuestring, auto_id);
+             "'%s' %s 자동화를 등록했습니다 (ID: %s, config_id: %s). HA UI에서 확인 가능합니다.",
+             entity.friendly_name, dev_action_j->valuestring, resolved_eid, auto_id);
     cJSON_AddStringToObject(resp, "message", msg);
     cJSON_AddStringToObject(resp, "automation_id", auto_id);
-    cJSON_AddStringToObject(resp, "entity_id", auto_id);
+    cJSON_AddStringToObject(resp, "entity_id", resolved_eid);
     cJSON_AddNumberToObject(resp, "raw_status", http_status);
     char *s = cJSON_PrintUnformatted(resp);
     if (s) { snprintf(output, output_size, "%s", s); free(s); }
@@ -381,10 +434,13 @@ static esp_err_t do_list(char *output, size_t output_size)
                                    cJSON_IsString(fn) ? fn->valuestring : "");
             cJSON_AddStringToObject(item, "state",
                                    cJSON_IsString(st) ? st->valuestring : "");
-            cJSON_AddBoolToObject(item, "esp_claw_managed",
-                                  strstr(eid->valuestring, "esp_claw_") != NULL);
+            const cJSON *cid = cJSON_GetObjectItemCaseSensitive(attr, "id");
+            bool esp_managed = cJSON_IsString(cid) &&
+                               strncmp(cid->valuestring, "esp_claw_", 9) == 0;
+            cJSON_AddBoolToObject(item, "esp_claw_managed", esp_managed);
+            if (cJSON_IsString(cid)) cJSON_AddStringToObject(item, "config_id", cid->valuestring);
             cJSON_AddItemToArray(out_arr, item);
-            if (strstr(eid->valuestring, "esp_claw_")) count_esp++;
+            if (esp_managed) count_esp++;
         }
     }
     if (arr) cJSON_Delete(arr);
@@ -414,8 +470,14 @@ static esp_err_t do_service(const cJSON *root, const char *service,
     }
     const char *id = id_j->valuestring;
     if (strncmp(id, "automation.", 11) == 0) id += 11;
-    char entity_id[80];
-    snprintf(entity_id, sizeof(entity_id), "automation.%s", id);
+
+    char entity_id[96];
+    /* Try resolving via attributes.id first (covers our esp_claw_<ts> form).
+     * If not found, fall back to "automation.<id>" — works when caller passed
+     * the already-slugified entity_id local part. */
+    if (resolve_entity_id_by_config_id(id, entity_id, sizeof(entity_id)) != ESP_OK) {
+        snprintf(entity_id, sizeof(entity_id), "automation.%s", id);
+    }
 
     char http_resp[256];
     int http_status = 0;
@@ -495,9 +557,11 @@ static esp_err_t do_update(const cJSON *root, char *output, size_t output_size)
             return ESP_OK;
         }
         cJSON_DeleteItemFromObject(cfg, "trigger");
-        cJSON_AddItemToObject(cfg, "trigger", trigger_arr);
+        cJSON_DeleteItemFromObject(cfg, "triggers");
+        cJSON_AddItemToObject(cfg, "triggers", trigger_arr);
         cJSON_DeleteItemFromObject(cfg, "condition");
-        if (condition_arr) cJSON_AddItemToObject(cfg, "condition", condition_arr);
+        cJSON_DeleteItemFromObject(cfg, "conditions");
+        if (condition_arr) cJSON_AddItemToObject(cfg, "conditions", condition_arr);
     }
 
     /* target/device_action change → rebuild action[].
@@ -517,7 +581,8 @@ static esp_err_t do_update(const cJSON *root, char *output, size_t output_size)
             target_name = target_j->valuestring;
         } else {
             /* Pull entity_id from existing action[0].target.entity_id */
-            const cJSON *existing_act = cJSON_GetObjectItem(cfg, "action");
+            const cJSON *existing_act = cJSON_GetObjectItem(cfg, "actions");
+            if (!cJSON_IsArray(existing_act)) existing_act = cJSON_GetObjectItem(cfg, "action");
             if (cJSON_IsArray(existing_act) && cJSON_GetArraySize(existing_act) > 0) {
                 const cJSON *step0 = cJSON_GetArrayItem(existing_act, 0);
                 const cJSON *tgt = cJSON_GetObjectItem(step0, "target");
@@ -531,10 +596,12 @@ static esp_err_t do_update(const cJSON *root, char *output, size_t output_size)
             dev_action = dev_action_j->valuestring;
         } else {
             /* Pull from existing action[0].service ("light.turn_on" → "turn_on"). */
-            const cJSON *existing_act = cJSON_GetObjectItem(cfg, "action");
+            const cJSON *existing_act = cJSON_GetObjectItem(cfg, "actions");
+            if (!cJSON_IsArray(existing_act)) existing_act = cJSON_GetObjectItem(cfg, "action");
             if (cJSON_IsArray(existing_act) && cJSON_GetArraySize(existing_act) > 0) {
                 const cJSON *step0 = cJSON_GetArrayItem(existing_act, 0);
                 const cJSON *svc = cJSON_GetObjectItem(step0, "service");
+                if (!cJSON_IsString(svc)) svc = cJSON_GetObjectItem(step0, "action");
                 if (cJSON_IsString(svc)) {
                     const char *dot = strchr(svc->valuestring, '.');
                     if (dot) dev_action = dot + 1;
@@ -578,7 +645,8 @@ static esp_err_t do_update(const cJSON *root, char *output, size_t output_size)
             return ESP_OK;
         }
         cJSON_DeleteItemFromObject(cfg, "action");
-        cJSON_AddItemToObject(cfg, "action", new_action);
+        cJSON_DeleteItemFromObject(cfg, "actions");
+        cJSON_AddItemToObject(cfg, "actions", new_action);
     }
 
     const cJSON *alias_j = cJSON_GetObjectItem(root, "alias");
