@@ -109,6 +109,16 @@ User가 실 Telegram client에서 `/start` 새로 시작 후 HA 기기 + 보드 
 - Setup wizard ha_url/ha_token 필드 추가 + NVS namespace 통합 (`app_config` ↔ `ha_ctl`) → v4
 - `cap_ha_http_get_url_alloc(char **out)` / `_token_alloc` 으로 caller-buffer 한계 완전 제거 → v4
 
+## Pre-landing review findings → v4 follow-up
+
+`/review` (2026-05-11)에서 다음 5개 발견. 모두 v4 follow-up PR로 미룸 (현재 PR에 race + mechanical fix 포함 안 함):
+
+1. **[P1, conf 8/10] `cap_ha_control_resolve.c:312-314` — `s_cache_registry` refresh race.** `cap_ha_resolve_refresh_from_ha`가 free + reassign + re-parse를 mutex 없이 수행. `cap_ha_resolve_target` / `_top_candidates` 가 같은 전역을 iterate. boot_fetch_task(~50ms window) 또는 콘솔 `--refresh-registry`에 LLM 호출이 겹치면 use-after-free. Fix: `xSemaphoreCreateMutex` 로 read/write 보호 또는 atomic pointer swap.
+2. **[P2, conf 9/10] `cap_ha_control_core.c:44-51` — `#rrggbb` invalid hex silently parses.** `strtol(..., 16)`가 non-hex char에 0 반환 → `"#FFGG00"` → silently red `(0xFF,0,0)`. LLM이 잘못된 hex 생성할 가능성 있음. Fix: `isxdigit()` 6-char 검증 후 strtol.
+3. **[P2, conf 7/10] `cap_ha_control_resolve.c:50` — `parse_registry` no entity count cap.** untrusted JSON `count`로 calloc — 악의/오설정 HA가 10K entries 보내면 ~1.5MB. ESP32-S3 + PSRAM이라 죽지는 않지만 heap fragment. Cap 64 entries 정도.
+4. **[P3, conf 9/10] `cap_ha_control.c:42` — description doesn't refresh after boot-fetch.** `compose_description()`이 group_init 1회만. boot_fetch가 추가한 entities는 다음 boot까지 LLM description 반영 안 됨. Fix: boot_fetch_task가 refresh 후 compose_description 재호출 (descriptor pointer 변경이 LLM context에 즉시 propagate되는지 검증 필요).
+5. **[P3, conf 6/10] `cap_ha_control_http.c` — Bearer token over HTTP plaintext.** LAN sniffable. 이미 HA secure NVS storage v4 항목에 포함됨 — HTTPS support는 별도 v4 항목으로.
+
 ## Review 인사이트
 Plan을 따라 implementation 중 발견한 plan-vs-code mismatch:
 - `claw_cap_execute_fn` 시그니처가 plan에서 `(descriptor, input_json, output, output_size, user_ctx)`였으나 실제 `claw_cap.h:62-65`는 `(input_json, const claw_cap_call_context_t *ctx, output, output_size)` — `cap_mcp_client.c:74-77` 패턴과 일치하도록 채택.
