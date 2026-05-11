@@ -376,8 +376,18 @@ esp_err_t cap_mcp_call_remote_tool(const char *input_json, cJSON **result_out)
      * silently failed while the LLM narrated success. */
     if (!arguments || !cJSON_IsObject(arguments) || cJSON_GetArraySize(arguments) == 0) {
         cJSON *err_root = cJSON_CreateObject();
+        if (!err_root) {
+            cJSON_Delete(arguments);
+            return ESP_ERR_NO_MEM;
+        }
         cJSON *content_arr = cJSON_AddArrayToObject(err_root, "content");
         cJSON *text_obj = cJSON_CreateObject();
+        if (!content_arr || !text_obj) {
+            cJSON_Delete(text_obj);
+            cJSON_Delete(err_root);
+            cJSON_Delete(arguments);
+            return ESP_ERR_NO_MEM;
+        }
         cJSON_AddStringToObject(text_obj, "type", "text");
         cJSON_AddStringToObject(text_obj, "text",
             "mcp_call_tool requires a non-empty 'arguments' object. "
