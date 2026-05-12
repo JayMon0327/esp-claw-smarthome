@@ -310,8 +310,12 @@ esp_err_t cap_ha_resolve_refresh_from_ha(void)
         size_t dlen = (size_t)(dot - id);
         if (dlen >= sizeof(domain)) continue;
         memcpy(domain, id, dlen);
+        /* binary_sensor 만 포함 (state-trigger 의 entity 후보). 일반 sensor.*
+         * (temp/humidity/battery 등) 는 typical HA install 에 수십 개라 NVS
+         * blob 폭발 (E2E 에서 ESP_ERR_NVS_NOT_ENOUGH_SPACE 확인). 추후 numeric
+         * sensor trigger 필요시 별도 cache 분리 또는 NVS 용량 확대로 처리. */
         if (strcmp(domain, "light") != 0 && strcmp(domain, "cover") != 0 &&
-            strcmp(domain, "switch") != 0) continue;
+            strcmp(domain, "switch") != 0 && strcmp(domain, "binary_sensor") != 0) continue;
 
         const cJSON *fn_j = cJSON_GetObjectItemCaseSensitive(attr, "friendly_name");
         const char *friendly = (cJSON_IsString(fn_j) && fn_j->valuestring[0])

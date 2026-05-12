@@ -179,10 +179,61 @@ static esp_err_t build_ha_trigger_array(const cJSON *trigger_in,
             cJSON_AddStringToObject(step, "hours", val);
         }
         cJSON_AddItemToArray(arr, step);
+    } else if (strcmp(kind, "state") == 0) {
+        /* HA state platform 분기 — door sensor → light 같은 entity-state-change.
+         * 입력: trigger.entity (friendly name or entity_id), trigger.to (필수),
+         *       trigger.from (optional). 'for' (duration), template, attribute
+         *       change 같은 advanced 옵션은 v4 에서 제외 (v5 후속). */
+        const cJSON *entity_j = cJSON_GetObjectItem(trigger_in, "entity");
+        const cJSON *to_j     = cJSON_GetObjectItem(trigger_in, "to");
+        const cJSON *from_j   = cJSON_GetObjectItem(trigger_in, "from");
+        if (!cJSON_IsString(entity_j) || !entity_j->valuestring[0] ||
+            !cJSON_IsString(to_j) || !to_j->valuestring[0]) {
+            cJSON_Delete(arr);
+            snprintf(err_msg, err_msg_size,
+                     "state trigger 에는 entity 와 to (둘 다 비어있지 않은 문자열) 가 필요합니다.");
+            return ESP_ERR_INVALID_ARG;
+        }
+        /* friendly_name 으로 들어오면 registry 로 entity_id 해석, 이미 'domain.<x>'
+         * 형식이면 그대로 사용 (registry 미적재 entity 도 사용자가 직접 지정 가능). */
+        const char *resolved_eid = NULL;
+        cap_ha_entity_t e = {0};
+        if (strchr(entity_j->valuestring, '.') != NULL &&
+            strncmp(entity_j->valuestring, "board:", 6) != 0) {
+            /* entity_id 같이 보이면 verbatim */
+            resolved_eid = entity_j->valuestring;
+        } else if (cap_ha_resolve_target(entity_j->valuestring, &e) == ESP_OK) {
+            if (strcmp(e.domain, "board") == 0) {
+                cJSON_Delete(arr);
+                snprintf(err_msg, err_msg_size,
+                         "보드 entity (%s) 는 state trigger 의 entity 로 사용할 수 없습니다.",
+                         entity_j->valuestring);
+                return ESP_ERR_INVALID_ARG;
+            }
+            resolved_eid = e.id;
+        } else {
+            cJSON_Delete(arr);
+            char cand[192];
+            cap_ha_resolve_top_candidates(cand, sizeof(cand), 5);
+            snprintf(err_msg, err_msg_size,
+                     "trigger.entity \"%s\" 를 해석하지 못했습니다. 후보: %s.",
+                     entity_j->valuestring, cand);
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        cJSON *step = cJSON_CreateObject();
+        cJSON_AddStringToObject(step, "platform", "state");
+        cJSON_AddStringToObject(step, "entity_id", resolved_eid);
+        cJSON_AddStringToObject(step, "to", to_j->valuestring);
+        if (cJSON_IsString(from_j) && from_j->valuestring[0]) {
+            cJSON_AddStringToObject(step, "from", from_j->valuestring);
+        }
+        cJSON_AddItemToArray(arr, step);
     } else {
         cJSON_Delete(arr);
         snprintf(err_msg, err_msg_size,
-                 "지원하지 않는 trigger.kind입니다 (%s). daily_time/weekly/interval만 지원.", kind);
+                 "지원하지 않는 trigger.kind입니다 (%s). "
+                 "daily_time/weekly/interval/state 만 지원.", kind);
         return ESP_ERR_INVALID_ARG;
     }
 
