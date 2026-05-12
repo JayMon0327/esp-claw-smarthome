@@ -20,6 +20,8 @@ static struct {
     struct arg_lit *refresh;
     struct arg_str *set_url;
     struct arg_str *set_token;
+    struct arg_str *set_insecure;
+    struct arg_str *automation;
     struct arg_end *end;
 } ha_args;
 
@@ -40,6 +42,13 @@ static int cmd_ha_control(int argc, char **argv)
     if (ha_args.set_token->count > 0) {
         esp_err_t err = cap_ha_http_set_token(ha_args.set_token->sval[0]);
         printf("set_token: %s\n", esp_err_to_name(err));
+        return (err == ESP_OK) ? 0 : 1;
+    }
+    if (ha_args.set_insecure->count > 0) {
+        const char *v = ha_args.set_insecure->sval[0];
+        bool ins = (strcmp(v, "on") == 0 || strcmp(v, "true") == 0 || strcmp(v, "1") == 0);
+        esp_err_t err = cap_ha_http_set_insecure(ins);
+        printf("set_insecure: %s (value=%s)\n", esp_err_to_name(err), ins ? "on" : "off");
         return (err == ESP_OK) ? 0 : 1;
     }
     if (ha_args.refresh->count > 0) {
@@ -66,8 +75,15 @@ static int cmd_ha_control(int argc, char **argv)
         printf("%s\n", output);
         return 0;
     }
+    if (ha_args.automation->count > 0) {
+        char output[1024];
+        esp_err_t err = cap_ha_automation_execute(ha_args.automation->sval[0],
+                                                  output, sizeof(output));
+        printf("%s\n", output);
+        return (err == ESP_OK) ? 0 : 1;
+    }
 
-    printf("ha_control: at least one of --call/--resolve/--refresh-registry/--set-url/--set-token required\n");
+    printf("ha_control: at least one of --call/--resolve/--refresh-registry/--set-url/--set-token/--set-insecure/--automation required\n");
     return 1;
 }
 
@@ -78,11 +94,15 @@ esp_err_t cmd_cap_ha_control_register(void)
     ha_args.refresh   = arg_lit0(NULL, "refresh-registry", "fetch /api/states and update NVS cache");
     ha_args.set_url   = arg_str0(NULL, "set-url", "<url>", "store HA URL in NVS");
     ha_args.set_token = arg_str0(NULL, "set-token", "<token>", "store HA bearer token in NVS");
-    ha_args.end       = arg_end(2);
+    ha_args.set_insecure = arg_str0(NULL, "set-insecure", "<on|off>",
+                                    "Skip TLS cert verify for https:// HA URLs (demo only)");
+    ha_args.automation = arg_str0(NULL, "automation", "<json>",
+                                  "Run cap_ha_automation_execute directly with a typed JSON payload");
+    ha_args.end       = arg_end(4);
 
     static const esp_console_cmd_t cmd = {
         .command = "ha_control",
-        .help = "ha_control --call '<json>' | --resolve <target> | --refresh-registry | --set-url <url> | --set-token <token>",
+        .help = "ha_control --call '<json>' | --resolve <target> | --refresh-registry | --set-url <url> | --set-token <token> | --set-insecure <on|off> | --automation '<json>'",
         .hint = NULL,
         .func = &cmd_ha_control,
         .argtable = &ha_args,

@@ -6,6 +6,7 @@
 #include "cap_ha_control_internal.h"
 #include "cJSON.h"
 #include "esp_log.h"
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,6 +43,9 @@ esp_err_t cap_ha_color_to_rgb(const char *color, int rgb_out[3])
     if (!color || !*color) return ESP_ERR_INVALID_ARG;
 
     if (color[0] == '#' && strlen(color) == 7) {
+        for (size_t i = 1; i < 7; i++) {
+            if (!isxdigit((unsigned char)color[i])) return ESP_ERR_INVALID_ARG;
+        }
         char r[3] = { color[1], color[2], 0 };
         char g[3] = { color[3], color[4], 0 };
         char b[3] = { color[5], color[6], 0 };
@@ -124,6 +128,25 @@ static void emit_failure(char *output, size_t output_size, const char *message)
                  "{\"success\":false,\"message\":\"internal error\",\"entity_id\":null,\"raw_status\":null}");
     }
     cJSON_Delete(root);
+}
+
+const char *cap_ha_action_to_service(const char *domain, const char *action)
+{
+    if (!domain || !action) return NULL;
+    if (strcmp(domain, "light") == 0) {
+        if (strcmp(action, "turn_on") == 0)  return "turn_on";
+        if (strcmp(action, "turn_off") == 0) return "turn_off";
+        if (strcmp(action, "toggle") == 0)   return "toggle";
+    } else if (strcmp(domain, "cover") == 0) {
+        if (strcmp(action, "open") == 0)     return "open_cover";
+        if (strcmp(action, "close") == 0)    return "close_cover";
+        if (strcmp(action, "toggle") == 0)   return "toggle";
+    } else if (strcmp(domain, "switch") == 0) {
+        if (strcmp(action, "turn_on") == 0)  return "turn_on";
+        if (strcmp(action, "turn_off") == 0) return "turn_off";
+        if (strcmp(action, "toggle") == 0)   return "toggle";
+    }
+    return NULL;
 }
 
 esp_err_t cap_ha_core_execute(const char *input_json,
@@ -225,20 +248,7 @@ esp_err_t cap_ha_core_execute(const char *input_json,
     }
 
     /* HA branch — service mapping per spec section 5. */
-    const char *svc = NULL;
-    if (strcmp(entity.domain, "light") == 0) {
-        if (strcmp(action, "turn_on") == 0)        svc = "turn_on";
-        else if (strcmp(action, "turn_off") == 0)  svc = "turn_off";
-        else if (strcmp(action, "toggle") == 0)    svc = "toggle";
-    } else if (strcmp(entity.domain, "cover") == 0) {
-        if (strcmp(action, "open") == 0)           svc = "open_cover";
-        else if (strcmp(action, "close") == 0)     svc = "close_cover";
-        else if (strcmp(action, "toggle") == 0)    svc = "toggle";
-    } else if (strcmp(entity.domain, "switch") == 0) {
-        if (strcmp(action, "turn_on") == 0)        svc = "turn_on";
-        else if (strcmp(action, "turn_off") == 0)  svc = "turn_off";
-        else if (strcmp(action, "toggle") == 0)    svc = "toggle";
-    }
+    const char *svc = cap_ha_action_to_service(entity.domain, action);
     if (!svc) {
         char msg[200];
         snprintf(msg, sizeof(msg),

@@ -5,6 +5,7 @@ idf_component_register(
         "src/cap_ha_control_resolve.c"
         "src/cap_ha_control_http.c"
         "src/cap_ha_control_board.c"
+        "src/cap_ha_automation.c"
         "src/cmd_cap_ha_control.c"
     INCLUDE_DIRS
         "include"
