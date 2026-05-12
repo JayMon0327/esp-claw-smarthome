@@ -448,9 +448,21 @@ static esp_err_t do_create(const cJSON *root, char *output, size_t output_size)
     }
 
     char resolved_eid[96] = {0};
-    if (resolve_entity_id_by_config_id(auto_id, resolved_eid, sizeof(resolved_eid)) != ESP_OK) {
+    esp_err_t reid_err = resolve_entity_id_by_config_id(auto_id, resolved_eid, sizeof(resolved_eid));
+    if (reid_err == ESP_OK) {
+        /* cache put 은 resolve_entity_id_by_config_id slow-path 가 이미 했지만
+         * 명시적 재호출은 cache fast-path 적중 케이스 (이 시점엔 거의 없음)
+         * 에서도 일관성 보장. NVS dup write 는 1ms 미만. */
+        eid_cache_put(auto_id, resolved_eid);
+    } else {
+        /* eventual consistency: POST 직후 /api/states reflect 안된 경우.
+         * fallback 으로 "automation.<auto_id>" 형태 사용하되 cache 에는
+         * 넣지 않음 — 잘못된 mapping 으로 service 호출이 silently no-op 할 수
+         * 있어 cache 오염이 더 위험. */
         snprintf(resolved_eid, sizeof(resolved_eid), "automation.%s", auto_id);
-        ESP_LOGW(TAG, "post-create entity_id lookup miss; using fallback %s", resolved_eid);
+        ESP_LOGW(TAG, "post-create entity_id lookup miss (err=%s); "
+                      "using fallback %s without caching",
+                 esp_err_to_name(reid_err), resolved_eid);
     }
 
     cJSON *resp = cJSON_CreateObject();
