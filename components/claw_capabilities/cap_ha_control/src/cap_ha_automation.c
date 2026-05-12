@@ -619,6 +619,32 @@ static esp_err_t do_create(const cJSON *root, char *output, size_t output_size)
         return ESP_OK;
     }
 
+    /* User-provided condition (independent of trigger.weekly's auto-emit). */
+    const cJSON *user_cond = cJSON_GetObjectItem(root, "condition");
+    if (cJSON_IsObject(user_cond)) {
+        cJSON *user_cond_arr = NULL;
+        char cond_err[160];
+        if (build_ha_condition_array(user_cond, &user_cond_arr,
+                                     cond_err, sizeof(cond_err)) != ESP_OK) {
+            emit_auto_failure(output, output_size, cond_err);
+            cJSON_Delete(action_arr);
+            if (trigger_arr)   cJSON_Delete(trigger_arr);
+            if (condition_arr) cJSON_Delete(condition_arr);
+            return ESP_OK;
+        }
+        /* Merge: weekly auto-condition 이 있으면 AND, 없으면 user-only. */
+        if (condition_arr) {
+            cJSON *step = NULL;
+            cJSON_ArrayForEach(step, user_cond_arr) {
+                cJSON *dup = cJSON_Duplicate(step, true);
+                if (dup) cJSON_AddItemToArray(condition_arr, dup);
+            }
+            cJSON_Delete(user_cond_arr);
+        } else {
+            condition_arr = user_cond_arr;
+        }
+    }
+
     cJSON *config = cJSON_CreateObject();
     cJSON_AddStringToObject(config, "alias",
                             (cJSON_IsString(alias_j) && alias_j->valuestring[0])
@@ -910,6 +936,27 @@ static esp_err_t do_update(const cJSON *root, char *output, size_t output_size)
         cJSON_DeleteItemFromObject(cfg, "condition");
         cJSON_DeleteItemFromObject(cfg, "conditions");
         if (condition_arr) cJSON_AddItemToObject(cfg, "conditions", condition_arr);
+    }
+
+    /* condition 만 단독 update (trigger 안 보내고 condition 만 보낸 경우),
+     * 또는 trigger 와 함께 update (위 블록에서 weekly auto-condition 만
+     * 들어가 있을 수 있음) 모두 처리. */
+    const cJSON *user_cond = cJSON_GetObjectItem(root, "condition");
+    if (cJSON_IsObject(user_cond)) {
+        cJSON *user_cond_arr = NULL;
+        char cond_err[160];
+        if (build_ha_condition_array(user_cond, &user_cond_arr,
+                                     cond_err, sizeof(cond_err)) != ESP_OK) {
+            cJSON_Delete(cfg);
+            emit_auto_failure(output, output_size, cond_err);
+            return ESP_OK;
+        }
+        /* user 가 condition 명시했으면 기존 conditions 를 완전 교체.
+         * 이전 trigger update 블록에서 weekly auto-condition 이 들어갔을 수
+         * 있으므로 그것까지 함께 교체됨 — 사용자 의도 우선. */
+        cJSON_DeleteItemFromObject(cfg, "condition");
+        cJSON_DeleteItemFromObject(cfg, "conditions");
+        cJSON_AddItemToObject(cfg, "conditions", user_cond_arr);
     }
 
     /* target/device_action change → rebuild action[].
