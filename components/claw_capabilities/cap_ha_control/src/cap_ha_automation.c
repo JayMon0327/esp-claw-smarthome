@@ -186,10 +186,11 @@ static esp_err_t build_ha_trigger_array(const cJSON *trigger_in,
         const cJSON *entity_j = cJSON_GetObjectItem(trigger_in, "entity");
         const cJSON *to_j     = cJSON_GetObjectItem(trigger_in, "to");
         const cJSON *from_j   = cJSON_GetObjectItem(trigger_in, "from");
-        if (!cJSON_IsString(entity_j) || !cJSON_IsString(to_j)) {
+        if (!cJSON_IsString(entity_j) || !entity_j->valuestring[0] ||
+            !cJSON_IsString(to_j) || !to_j->valuestring[0]) {
             cJSON_Delete(arr);
             snprintf(err_msg, err_msg_size,
-                     "state trigger 에는 entity 와 to 가 모두 필요합니다.");
+                     "state trigger 에는 entity 와 to (둘 다 비어있지 않은 문자열) 가 필요합니다.");
             return ESP_ERR_INVALID_ARG;
         }
         /* friendly_name 으로 들어오면 registry 로 entity_id 해석, 이미 'domain.<x>'
