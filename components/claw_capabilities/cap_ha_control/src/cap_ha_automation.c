@@ -282,6 +282,127 @@ static esp_err_t build_ha_trigger_array(const cJSON *trigger_in,
     return ESP_OK;
 }
 
+/* Translate a user condition spec into HA-native condition[].
+ * Out: condition_out (caller owns, may be NULL on empty/error).
+ * Supported kinds:
+ *   - time_range: { kind: "time_range", after: "HH:MM", before: "HH:MM" }
+ *       하나 또는 양쪽 모두 가능. after only = "after 시각부터 자정까지",
+ *       before only = "자정부터 before 시각까지", 둘 다 = 그 구간.
+ *   - weekday: { kind: "weekday", weekdays: [0..6] }  (0=Sunday)
+ *   - state:   { kind: "state", entity: "<friendly|entity_id>", state: "..." }
+ *
+ * 'for' duration, OR/NOT 복합, template, numeric_state, sun condition 등은
+ * v6 후속.
+ */
+static esp_err_t build_ha_condition_array(const cJSON *condition_in,
+                                          cJSON **condition_out,
+                                          char *err_msg, size_t err_msg_size)
+{
+    *condition_out = NULL;
+    if (!cJSON_IsObject(condition_in)) {
+        snprintf(err_msg, err_msg_size, "condition 은 객체여야 합니다.");
+        return ESP_ERR_INVALID_ARG;
+    }
+    const cJSON *kind_j = cJSON_GetObjectItem(condition_in, "kind");
+    const char *kind = cJSON_IsString(kind_j) ? kind_j->valuestring : NULL;
+    if (!kind) {
+        snprintf(err_msg, err_msg_size, "condition.kind 가 필요합니다.");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    cJSON *arr = cJSON_CreateArray();
+    cJSON *step = cJSON_CreateObject();
+
+    if (strcmp(kind, "time_range") == 0) {
+        const cJSON *after_j  = cJSON_GetObjectItem(condition_in, "after");
+        const cJSON *before_j = cJSON_GetObjectItem(condition_in, "before");
+        bool has_after  = cJSON_IsString(after_j)  && after_j->valuestring[0];
+        bool has_before = cJSON_IsString(before_j) && before_j->valuestring[0];
+        if (!has_after && !has_before) {
+            cJSON_Delete(step); cJSON_Delete(arr);
+            snprintf(err_msg, err_msg_size,
+                     "time_range condition 에는 after / before 중 하나 이상 필요합니다.");
+            return ESP_ERR_INVALID_ARG;
+        }
+        /* HH:MM validate (간단 — 5 chars + ':' at index 2). */
+        if (has_after && (strlen(after_j->valuestring) != 5 || after_j->valuestring[2] != ':')) {
+            cJSON_Delete(step); cJSON_Delete(arr);
+            snprintf(err_msg, err_msg_size, "condition.after 는 'HH:MM' 형식이어야 합니다.");
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (has_before && (strlen(before_j->valuestring) != 5 || before_j->valuestring[2] != ':')) {
+            cJSON_Delete(step); cJSON_Delete(arr);
+            snprintf(err_msg, err_msg_size, "condition.before 는 'HH:MM' 형식이어야 합니다.");
+            return ESP_ERR_INVALID_ARG;
+        }
+        cJSON_AddStringToObject(step, "condition", "time");
+        if (has_after) {
+            char buf[12]; snprintf(buf, sizeof(buf), "%s:00", after_j->valuestring);
+            cJSON_AddStringToObject(step, "after", buf);
+        }
+        if (has_before) {
+            char buf[12]; snprintf(buf, sizeof(buf), "%s:00", before_j->valuestring);
+            cJSON_AddStringToObject(step, "before", buf);
+        }
+    } else if (strcmp(kind, "weekday") == 0) {
+        const cJSON *days = cJSON_GetObjectItem(condition_in, "weekdays");
+        if (!cJSON_IsArray(days) || cJSON_GetArraySize(days) == 0) {
+            cJSON_Delete(step); cJSON_Delete(arr);
+            snprintf(err_msg, err_msg_size,
+                     "weekday condition 에는 weekdays 배열이 필요합니다.");
+            return ESP_ERR_INVALID_ARG;
+        }
+        static const char *DAY_NAMES[] = {"sun","mon","tue","wed","thu","fri","sat"};
+        cJSON_AddStringToObject(step, "condition", "time");
+        cJSON *weekday_arr = cJSON_CreateArray();
+        cJSON *d = NULL;
+        cJSON_ArrayForEach(d, days) {
+            if (cJSON_IsNumber(d) && d->valueint >= 0 && d->valueint <= 6) {
+                cJSON_AddItemToArray(weekday_arr,
+                                     cJSON_CreateString(DAY_NAMES[d->valueint]));
+            }
+        }
+        cJSON_AddItemToObject(step, "weekday", weekday_arr);
+    } else if (strcmp(kind, "state") == 0) {
+        const cJSON *entity_j = cJSON_GetObjectItem(condition_in, "entity");
+        const cJSON *state_j  = cJSON_GetObjectItem(condition_in, "state");
+        if (!cJSON_IsString(entity_j) || !entity_j->valuestring[0] ||
+            !cJSON_IsString(state_j)  || !state_j->valuestring[0]) {
+            cJSON_Delete(step); cJSON_Delete(arr);
+            snprintf(err_msg, err_msg_size,
+                     "state condition 에는 entity 와 state (둘 다 비어있지 않은 문자열) 가 필요합니다.");
+            return ESP_ERR_INVALID_ARG;
+        }
+        /* entity 해석 — state trigger 와 동일 패턴 (verbatim 또는 resolve). */
+        const char *resolved_eid = NULL;
+        cap_ha_entity_t e = {0};
+        if (strchr(entity_j->valuestring, '.') != NULL &&
+            strncmp(entity_j->valuestring, "board:", 6) != 0) {
+            resolved_eid = entity_j->valuestring;
+        } else if (cap_ha_resolve_target(entity_j->valuestring, &e) == ESP_OK) {
+            resolved_eid = e.id;
+        } else {
+            cJSON_Delete(step); cJSON_Delete(arr);
+            snprintf(err_msg, err_msg_size,
+                     "condition.entity \"%s\" 를 해석하지 못했습니다.", entity_j->valuestring);
+            return ESP_ERR_INVALID_ARG;
+        }
+        cJSON_AddStringToObject(step, "condition", "state");
+        cJSON_AddStringToObject(step, "entity_id", resolved_eid);
+        cJSON_AddStringToObject(step, "state", state_j->valuestring);
+    } else {
+        cJSON_Delete(step); cJSON_Delete(arr);
+        snprintf(err_msg, err_msg_size,
+                 "지원하지 않는 condition.kind 입니다 (%s). "
+                 "time_range / weekday / state 만 지원.", kind);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    cJSON_AddItemToArray(arr, step);
+    *condition_out = arr;
+    return ESP_OK;
+}
+
 /* ─── entity_id 캐시 (NVS, JSON 블롭 단일 키) ─────────────────────────
  * HA modern schema 는 자동화 entity_id 를 alias slug 에서 파생하므로
  * config_id (esp_claw_<ts>) → entity_id (automation.<slug>) 매핑은
