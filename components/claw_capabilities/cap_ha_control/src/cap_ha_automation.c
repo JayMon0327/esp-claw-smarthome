@@ -90,6 +90,29 @@ static cJSON *build_ha_action_array(const cap_ha_entity_t *entity,
     return arr;
 }
 
+/* Return the natural opposite of `to_val` for `domain`, or NULL if no
+ * sensible default exists. Used in state trigger to force HA transition
+ * semantics — `to: "on"` alone fires on every attribute-update, but
+ * pairing with `from: "off"` makes HA require an actual transition. */
+static const char *opposite_state(const char *domain, const char *to_val)
+{
+    if (!domain || !to_val) return NULL;
+    if (strcmp(domain, "binary_sensor") == 0 ||
+        strcmp(domain, "light") == 0 ||
+        strcmp(domain, "switch") == 0 ||
+        strcmp(domain, "input_boolean") == 0) {
+        if (strcmp(to_val, "on")  == 0) return "off";
+        if (strcmp(to_val, "off") == 0) return "on";
+    } else if (strcmp(domain, "cover") == 0) {
+        if (strcmp(to_val, "open")   == 0) return "closed";
+        if (strcmp(to_val, "closed") == 0) return "open";
+    } else if (strcmp(domain, "lock") == 0) {
+        if (strcmp(to_val, "locked")   == 0) return "unlocked";
+        if (strcmp(to_val, "unlocked") == 0) return "locked";
+    }
+    return NULL;
+}
+
 /* Translate user trigger spec into HA-native trigger[] (and optional condition[]).
  * Out params: trigger_out / condition_out (caller owns; condition_out may be NULL).
  * Returns ESP_OK + sets *trigger_out, or error with both NULL. */
@@ -225,8 +248,26 @@ static esp_err_t build_ha_trigger_array(const cJSON *trigger_in,
         cJSON_AddStringToObject(step, "platform", "state");
         cJSON_AddStringToObject(step, "entity_id", resolved_eid);
         cJSON_AddStringToObject(step, "to", to_j->valuestring);
+
+        /* from priority:
+         * 1) caller specified → pass verbatim (override allowed)
+         * 2) otherwise domain-pair opposite auto-fill (force transition)
+         * 3) no opposite for this domain → omit (HA default behavior) */
         if (cJSON_IsString(from_j) && from_j->valuestring[0]) {
             cJSON_AddStringToObject(step, "from", from_j->valuestring);
+        } else {
+            /* resolved_eid is always "domain.local". Extract domain. */
+            const char *dot = strchr(resolved_eid, '.');
+            char dom[20] = {0};
+            if (dot && (size_t)(dot - resolved_eid) < sizeof(dom)) {
+                memcpy(dom, resolved_eid, dot - resolved_eid);
+                const char *auto_from = opposite_state(dom, to_j->valuestring);
+                if (auto_from) {
+                    cJSON_AddStringToObject(step, "from", auto_from);
+                    ESP_LOGI(TAG, "state trigger from auto-fill: %s -> %s (domain=%s)",
+                             auto_from, to_j->valuestring, dom);
+                }
+            }
         }
         cJSON_AddItemToArray(arr, step);
     } else {
