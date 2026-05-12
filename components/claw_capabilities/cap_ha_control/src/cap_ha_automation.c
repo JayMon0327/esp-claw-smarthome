@@ -6,6 +6,7 @@
 #include "cJSON.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "nvs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -189,6 +190,101 @@ static esp_err_t build_ha_trigger_array(const cJSON *trigger_in,
     return ESP_OK;
 }
 
+/* ─── entity_id 캐시 (NVS, JSON 블롭 단일 키) ─────────────────────────
+ * HA modern schema 는 자동화 entity_id 를 alias slug 에서 파생하므로
+ * config_id (esp_claw_<ts>) → entity_id (automation.<slug>) 매핑은
+ * 외부로부터 받아야 한다 (cap_ha_http_get_states). 매 service 호출마다
+ * 64KB GET 은 비싸므로 NVS 에 캐싱. 32 항목 cap, 초과시 임의 1개 drop.
+ * 단일 블롭이라 lookup/put 모두 read-parse-mutate-write 라 동기 성능
+ * 비싸지 않지만 (수십 byte JSON), 빈번한 write 가 NVS 마모 유발 가능 —
+ * do_create / do_remove 만 mutate 이고 lookup 은 read-only 라 충분.
+ */
+static esp_err_t eid_cache_load(cJSON **out_obj)
+{
+    *out_obj = NULL;
+    nvs_handle_t h;
+    if (nvs_open(CAP_HA_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK)
+        return ESP_ERR_NOT_FOUND;
+    size_t need = 0;
+    esp_err_t err = nvs_get_blob(h, CAP_HA_NVS_KEY_EID_CACHE, NULL, &need);
+    if (err != ESP_OK || need == 0) { nvs_close(h); return ESP_ERR_NOT_FOUND; }
+    char *blob = malloc(need + 1);
+    if (!blob) { nvs_close(h); return ESP_ERR_NO_MEM; }
+    err = nvs_get_blob(h, CAP_HA_NVS_KEY_EID_CACHE, blob, &need);
+    nvs_close(h);
+    if (err != ESP_OK) { free(blob); return ESP_ERR_NOT_FOUND; }
+    blob[need] = '\0';
+    cJSON *obj = cJSON_Parse(blob);
+    free(blob);
+    if (!cJSON_IsObject(obj)) { if (obj) cJSON_Delete(obj); return ESP_ERR_NOT_FOUND; }
+    *out_obj = obj;
+    return ESP_OK;
+}
+
+static esp_err_t eid_cache_store(cJSON *obj)
+{
+    char *blob = cJSON_PrintUnformatted(obj);
+    if (!blob) return ESP_ERR_NO_MEM;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(CAP_HA_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) { free(blob); return err; }
+    err = nvs_set_blob(h, CAP_HA_NVS_KEY_EID_CACHE, blob, strlen(blob));
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    free(blob);
+    return err;
+}
+
+static esp_err_t eid_cache_lookup(const char *config_id,
+                                  char *out_entity_id, size_t out_size)
+{
+    if (!config_id || !out_entity_id || out_size == 0) return ESP_ERR_INVALID_ARG;
+    cJSON *obj = NULL;
+    if (eid_cache_load(&obj) != ESP_OK) return ESP_ERR_NOT_FOUND;
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(obj, config_id);
+    esp_err_t r = ESP_ERR_NOT_FOUND;
+    if (cJSON_IsString(v) && v->valuestring[0]) {
+        snprintf(out_entity_id, out_size, "%s", v->valuestring);
+        r = ESP_OK;
+    }
+    cJSON_Delete(obj);
+    return r;
+}
+
+static esp_err_t eid_cache_put(const char *config_id, const char *entity_id)
+{
+    if (!config_id || !entity_id) return ESP_ERR_INVALID_ARG;
+    cJSON *obj = NULL;
+    if (eid_cache_load(&obj) != ESP_OK) {
+        obj = cJSON_CreateObject();
+        if (!obj) return ESP_ERR_NO_MEM;
+    }
+    /* 동일 키 있으면 replace, 없으면 추가. cap 초과시 첫 항목 drop. */
+    cJSON_DeleteItemFromObjectCaseSensitive(obj, config_id);
+    if (cJSON_GetArraySize(obj) >= CAP_HA_EID_CACHE_MAX) {
+        cJSON *first = obj->child;
+        if (first && first->string) {
+            ESP_LOGI(TAG, "eid_cache full, drop oldest entry %s", first->string);
+            cJSON_DeleteItemFromObjectCaseSensitive(obj, first->string);
+        }
+    }
+    cJSON_AddStringToObject(obj, config_id, entity_id);
+    esp_err_t err = eid_cache_store(obj);
+    cJSON_Delete(obj);
+    return err;
+}
+
+static esp_err_t eid_cache_invalidate(const char *config_id)
+{
+    if (!config_id) return ESP_ERR_INVALID_ARG;
+    cJSON *obj = NULL;
+    if (eid_cache_load(&obj) != ESP_OK) return ESP_OK; /* no cache → nothing to drop */
+    cJSON_DeleteItemFromObjectCaseSensitive(obj, config_id);
+    esp_err_t err = eid_cache_store(obj);
+    cJSON_Delete(obj);
+    return err;
+}
+
 /* Resolve an automation's CONFIG id (our esp_claw_<ts>) to its actual HA
  * runtime entity_id (e.g., "automation.v4_update_debug"). HA derives the
  * entity_id from the alias slug, not from the config id, so subsequent
@@ -206,6 +302,11 @@ static esp_err_t resolve_entity_id_by_config_id(const char *config_id,
         return ESP_ERR_INVALID_ARG;
     out_entity_id[0] = '\0';
 
+    /* 1) NVS 캐시 fast-path. */
+    if (eid_cache_lookup(config_id, out_entity_id, out_size) == ESP_OK)
+        return ESP_OK;
+
+    /* 2) HA /api/states slow-path + 캐시 갱신. */
     char *states = malloc(CAP_HA_STATES_BUF_BYTES);
     if (!states) return ESP_ERR_NO_MEM;
     esp_err_t err = cap_ha_http_get_states(states, CAP_HA_STATES_BUF_BYTES);
@@ -233,6 +334,10 @@ static esp_err_t resolve_entity_id_by_config_id(const char *config_id,
         }
     }
     cJSON_Delete(arr);
+    if (result == ESP_OK) {
+        esp_err_t cerr = eid_cache_put(config_id, out_entity_id);
+        if (cerr != ESP_OK) ESP_LOGW(TAG, "eid_cache_put failed: %s", esp_err_to_name(cerr));
+    }
     return result;
 }
 
@@ -343,10 +448,19 @@ static esp_err_t do_create(const cJSON *root, char *output, size_t output_size)
     }
 
     char resolved_eid[96] = {0};
-    if (resolve_entity_id_by_config_id(auto_id, resolved_eid, sizeof(resolved_eid)) != ESP_OK) {
+    esp_err_t reid_err = resolve_entity_id_by_config_id(auto_id, resolved_eid, sizeof(resolved_eid));
+    if (reid_err != ESP_OK) {
+        /* eventual consistency: POST 직후 /api/states reflect 안된 경우.
+         * fallback 으로 "automation.<auto_id>" 형태 사용하되 cache 에는
+         * 넣지 않음 — 잘못된 mapping 으로 service 호출이 silently no-op 할 수
+         * 있어 cache 오염이 더 위험. */
         snprintf(resolved_eid, sizeof(resolved_eid), "automation.%s", auto_id);
-        ESP_LOGW(TAG, "post-create entity_id lookup miss; using fallback %s", resolved_eid);
+        ESP_LOGW(TAG, "post-create entity_id lookup miss (err=%s); "
+                      "using fallback %s without caching",
+                 esp_err_to_name(reid_err), resolved_eid);
     }
+    /* On success, resolve_entity_id_by_config_id slow-path already wrote
+     * the mapping into eid_cache — no explicit put needed here. */
 
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "success", true);
@@ -386,6 +500,9 @@ static esp_err_t do_remove(const cJSON *root, char *output, size_t output_size)
     }
     int reload_status = 0;
     cap_ha_http_reload_automations(&reload_status, http_resp, sizeof(http_resp));
+
+    /* HA 에서 사라졌으니 cache 항목도 invalidate. */
+    eid_cache_invalidate(id);
 
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "success", true);
@@ -472,11 +589,29 @@ static esp_err_t do_service(const cJSON *root, const char *service,
     if (strncmp(id, "automation.", 11) == 0) id += 11;
 
     char entity_id[96];
-    /* Try resolving via attributes.id first (covers our esp_claw_<ts> form).
-     * If not found, fall back to "automation.<id>" — works when caller passed
-     * the already-slugified entity_id local part. */
-    if (resolve_entity_id_by_config_id(id, entity_id, sizeof(entity_id)) != ESP_OK) {
-        snprintf(entity_id, sizeof(entity_id), "automation.%s", id);
+    /* config_id (esp_claw_<ts>) 형식이면 resolver 가 cache + HA states 로 해석.
+     * 사용자가 이미 slug 화된 'automation.<slug>' 형식의 entity_id 를 그대로
+     * 넘긴 경우엔 resolver 가 NOT_FOUND 반환 — 그때만 입력값 그대로 사용. */
+    if (strncmp(id, "esp_claw_", 9) == 0) {
+        /* 우리 firmware 가 만든 config_id 인데 매핑 못 찾으면 fail. silent
+         * fallback ('automation.esp_claw_<ts>') 은 HA 가 slug 와 다른 entity
+         * 로 등록했을 때 service 가 200 응답하면서도 실제론 no-op 하는
+         * 버그를 만든다 (c04c845 commit message 참조). */
+        if (resolve_entity_id_by_config_id(id, entity_id, sizeof(entity_id)) != ESP_OK) {
+            char msg[240];
+            snprintf(msg, sizeof(msg),
+                     "automation_id '%s' 에 해당하는 HA 자동화를 찾을 수 없습니다. "
+                     "list 명령으로 현재 등록된 entity_id 를 확인하세요.", id);
+            emit_auto_failure(output, output_size, msg);
+            return ESP_OK;
+        }
+    } else {
+        /* 'living_room_lights' 같은 사용자 slug — resolver 가 못 잡지만 그대로
+         * 사용 가능한 패턴. resolver 가 잡으면 더 정확하니 시도하되, 실패해도
+         * verbatim 통과. */
+        if (resolve_entity_id_by_config_id(id, entity_id, sizeof(entity_id)) != ESP_OK) {
+            snprintf(entity_id, sizeof(entity_id), "automation.%s", id);
+        }
     }
 
     char http_resp[256];

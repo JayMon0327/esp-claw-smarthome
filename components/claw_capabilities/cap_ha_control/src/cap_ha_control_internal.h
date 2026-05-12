@@ -15,6 +15,8 @@
 #define CAP_HA_NVS_KEY_TOKEN       "ha_token"
 #define CAP_HA_NVS_KEY_CACHE       "entity_cache"
 #define CAP_HA_NVS_KEY_INSECURE    "ha_insecure"  /* bool: skip TLS cert verify */
+#define CAP_HA_NVS_KEY_EID_CACHE   "eid_cache"   /* JSON: {"<config_id>": "<entity_id>"} */
+#define CAP_HA_EID_CACHE_MAX       32            /* config_id 매핑 최대 항목 (FIFO drop) */
 
 #define CAP_HA_HTTP_TIMEOUT_MS     8000
 
