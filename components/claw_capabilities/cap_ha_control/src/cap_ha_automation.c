@@ -504,6 +504,9 @@ static esp_err_t do_remove(const cJSON *root, char *output, size_t output_size)
     int reload_status = 0;
     cap_ha_http_reload_automations(&reload_status, http_resp, sizeof(http_resp));
 
+    /* HA 에서 사라졌으니 cache 항목도 invalidate. */
+    eid_cache_invalidate(id);
+
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "success", true);
     char msg[160];
