@@ -90,6 +90,52 @@ static cJSON *build_ha_action_array(const cap_ha_entity_t *entity,
     return arr;
 }
 
+/* For domains whose HA state vocabulary is exactly "on"/"off"
+ * (binary_sensor / light / switch / input_boolean), translate the
+ * door/window-flavored synonyms LLMs often pick from UI labels
+ * ("Open"/"Closed" display) into the actual state values HA matches
+ * against. Without this, an LLM that hears "도어 열림" naturally writes
+ * to:"open", the automation registers, and HA never fires it because
+ * the entity's state value is never literally "open" — it is "on".
+ * cover/lock keep their native vocabulary as-is. */
+static const char *normalize_state_value(const char *domain, const char *value)
+{
+    if (!domain || !value) return value;
+    if (strcmp(domain, "binary_sensor") == 0 ||
+        strcmp(domain, "light") == 0 ||
+        strcmp(domain, "switch") == 0 ||
+        strcmp(domain, "input_boolean") == 0) {
+        if (strcmp(value, "open")   == 0) return "on";
+        if (strcmp(value, "opened") == 0) return "on";
+        if (strcmp(value, "closed") == 0) return "off";
+    }
+    return value;
+}
+
+/* Return the natural opposite of `to_val` for `domain`, or NULL if no
+ * sensible default exists. Used in state trigger to force HA transition
+ * semantics — `to: "on"` alone fires on every attribute-update, but
+ * pairing with `from: "off"` makes HA require an actual transition.
+ * Caller is expected to pass `to_val` already through normalize_state_value. */
+static const char *opposite_state(const char *domain, const char *to_val)
+{
+    if (!domain || !to_val) return NULL;
+    if (strcmp(domain, "binary_sensor") == 0 ||
+        strcmp(domain, "light") == 0 ||
+        strcmp(domain, "switch") == 0 ||
+        strcmp(domain, "input_boolean") == 0) {
+        if (strcmp(to_val, "on")  == 0) return "off";
+        if (strcmp(to_val, "off") == 0) return "on";
+    } else if (strcmp(domain, "cover") == 0) {
+        if (strcmp(to_val, "open")   == 0) return "closed";
+        if (strcmp(to_val, "closed") == 0) return "open";
+    } else if (strcmp(domain, "lock") == 0) {
+        if (strcmp(to_val, "locked")   == 0) return "unlocked";
+        if (strcmp(to_val, "unlocked") == 0) return "locked";
+    }
+    return NULL;
+}
+
 /* Translate user trigger spec into HA-native trigger[] (and optional condition[]).
  * Out params: trigger_out / condition_out (caller owns; condition_out may be NULL).
  * Returns ESP_OK + sets *trigger_out, or error with both NULL. */
@@ -224,9 +270,43 @@ static esp_err_t build_ha_trigger_array(const cJSON *trigger_in,
         cJSON *step = cJSON_CreateObject();
         cJSON_AddStringToObject(step, "platform", "state");
         cJSON_AddStringToObject(step, "entity_id", resolved_eid);
-        cJSON_AddStringToObject(step, "to", to_j->valuestring);
+
+        /* resolved_eid is always "domain.local". Extract domain so we can
+         * normalize state values per domain vocabulary and auto-fill from. */
+        const char *dot = strchr(resolved_eid, '.');
+        char dom[20] = {0};
+        if (dot && (size_t)(dot - resolved_eid) < sizeof(dom)) {
+            memcpy(dom, resolved_eid, dot - resolved_eid);
+        }
+
+        /* Normalize to/from for on-off domains: "open"→"on", "closed"→"off".
+         * Critical for door/window binary_sensors where LLM hears the UI
+         * label "Open" and writes to:"open" — would register but never fire. */
+        const char *to_val = normalize_state_value(dom, to_j->valuestring);
+        cJSON_AddStringToObject(step, "to", to_val);
+        if (strcmp(to_val, to_j->valuestring) != 0) {
+            ESP_LOGI(TAG, "state trigger to normalized: %s -> %s (domain=%s)",
+                     to_j->valuestring, to_val, dom);
+        }
+
+        /* from priority:
+         * 1) caller specified → normalize, pass through (override allowed)
+         * 2) otherwise domain-pair opposite auto-fill (force transition)
+         * 3) no opposite for this domain → omit (HA default behavior) */
         if (cJSON_IsString(from_j) && from_j->valuestring[0]) {
-            cJSON_AddStringToObject(step, "from", from_j->valuestring);
+            const char *from_val = normalize_state_value(dom, from_j->valuestring);
+            cJSON_AddStringToObject(step, "from", from_val);
+            if (strcmp(from_val, from_j->valuestring) != 0) {
+                ESP_LOGI(TAG, "state trigger from normalized: %s -> %s (domain=%s)",
+                         from_j->valuestring, from_val, dom);
+            }
+        } else {
+            const char *auto_from = opposite_state(dom, to_val);
+            if (auto_from) {
+                cJSON_AddStringToObject(step, "from", auto_from);
+                ESP_LOGI(TAG, "state trigger from auto-fill: %s -> %s (domain=%s)",
+                         auto_from, to_val, dom);
+            }
         }
         cJSON_AddItemToArray(arr, step);
     } else {
@@ -238,6 +318,134 @@ static esp_err_t build_ha_trigger_array(const cJSON *trigger_in,
     }
 
     *trigger_out = arr;
+    return ESP_OK;
+}
+
+/* Translate a user condition spec into HA-native condition[].
+ * Out: condition_out (caller owns, may be NULL on empty/error).
+ * Supported kinds:
+ *   - time_range: { kind: "time_range", after: "HH:MM", before: "HH:MM" }
+ *       하나 또는 양쪽 모두 가능. after only = "after 시각부터 자정까지",
+ *       before only = "자정부터 before 시각까지", 둘 다 = 그 구간.
+ *   - weekday: { kind: "weekday", weekdays: [0..6] }  (0=Sunday)
+ *   - state:   { kind: "state", entity: "<friendly|entity_id>", state: "..." }
+ *
+ * 'for' duration, OR/NOT 복합, template, numeric_state, sun condition 등은
+ * v6 후속.
+ */
+static esp_err_t build_ha_condition_array(const cJSON *condition_in,
+                                          cJSON **condition_out,
+                                          char *err_msg, size_t err_msg_size)
+{
+    *condition_out = NULL;
+    if (!cJSON_IsObject(condition_in)) {
+        snprintf(err_msg, err_msg_size, "condition 은 객체여야 합니다.");
+        return ESP_ERR_INVALID_ARG;
+    }
+    const cJSON *kind_j = cJSON_GetObjectItem(condition_in, "kind");
+    const char *kind = cJSON_IsString(kind_j) ? kind_j->valuestring : NULL;
+    if (!kind) {
+        snprintf(err_msg, err_msg_size, "condition.kind 가 필요합니다.");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    cJSON *arr = cJSON_CreateArray();
+    cJSON *step = cJSON_CreateObject();
+
+    if (strcmp(kind, "time_range") == 0) {
+        const cJSON *after_j  = cJSON_GetObjectItem(condition_in, "after");
+        const cJSON *before_j = cJSON_GetObjectItem(condition_in, "before");
+        bool has_after  = cJSON_IsString(after_j)  && after_j->valuestring[0];
+        bool has_before = cJSON_IsString(before_j) && before_j->valuestring[0];
+        if (!has_after && !has_before) {
+            cJSON_Delete(step); cJSON_Delete(arr);
+            snprintf(err_msg, err_msg_size,
+                     "time_range condition 에는 after / before 중 하나 이상 필요합니다.");
+            return ESP_ERR_INVALID_ARG;
+        }
+        /* HH:MM validate (간단 — 5 chars + ':' at index 2). */
+        if (has_after && (strlen(after_j->valuestring) != 5 || after_j->valuestring[2] != ':')) {
+            cJSON_Delete(step); cJSON_Delete(arr);
+            snprintf(err_msg, err_msg_size, "condition.after 는 'HH:MM' 형식이어야 합니다.");
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (has_before && (strlen(before_j->valuestring) != 5 || before_j->valuestring[2] != ':')) {
+            cJSON_Delete(step); cJSON_Delete(arr);
+            snprintf(err_msg, err_msg_size, "condition.before 는 'HH:MM' 형식이어야 합니다.");
+            return ESP_ERR_INVALID_ARG;
+        }
+        cJSON_AddStringToObject(step, "condition", "time");
+        if (has_after) {
+            char buf[12]; snprintf(buf, sizeof(buf), "%s:00", after_j->valuestring);
+            cJSON_AddStringToObject(step, "after", buf);
+        }
+        if (has_before) {
+            char buf[12]; snprintf(buf, sizeof(buf), "%s:00", before_j->valuestring);
+            cJSON_AddStringToObject(step, "before", buf);
+        }
+    } else if (strcmp(kind, "weekday") == 0) {
+        const cJSON *days = cJSON_GetObjectItem(condition_in, "weekdays");
+        if (!cJSON_IsArray(days) || cJSON_GetArraySize(days) == 0) {
+            cJSON_Delete(step); cJSON_Delete(arr);
+            snprintf(err_msg, err_msg_size,
+                     "weekday condition 에는 weekdays 배열이 필요합니다.");
+            return ESP_ERR_INVALID_ARG;
+        }
+        static const char *DAY_NAMES[] = {"sun","mon","tue","wed","thu","fri","sat"};
+        cJSON_AddStringToObject(step, "condition", "time");
+        cJSON *weekday_arr = cJSON_CreateArray();
+        cJSON *d = NULL;
+        cJSON_ArrayForEach(d, days) {
+            if (cJSON_IsNumber(d) && d->valueint >= 0 && d->valueint <= 6) {
+                cJSON_AddItemToArray(weekday_arr,
+                                     cJSON_CreateString(DAY_NAMES[d->valueint]));
+            }
+        }
+        cJSON_AddItemToObject(step, "weekday", weekday_arr);
+    } else if (strcmp(kind, "state") == 0) {
+        const cJSON *entity_j = cJSON_GetObjectItem(condition_in, "entity");
+        const cJSON *state_j  = cJSON_GetObjectItem(condition_in, "state");
+        if (!cJSON_IsString(entity_j) || !entity_j->valuestring[0] ||
+            !cJSON_IsString(state_j)  || !state_j->valuestring[0]) {
+            cJSON_Delete(step); cJSON_Delete(arr);
+            snprintf(err_msg, err_msg_size,
+                     "state condition 에는 entity 와 state (둘 다 비어있지 않은 문자열) 가 필요합니다.");
+            return ESP_ERR_INVALID_ARG;
+        }
+        /* entity 해석 — state trigger 와 동일 패턴 (verbatim 또는 resolve). */
+        const char *resolved_eid = NULL;
+        cap_ha_entity_t e = {0};
+        if (strchr(entity_j->valuestring, '.') != NULL &&
+            strncmp(entity_j->valuestring, "board:", 6) != 0) {
+            resolved_eid = entity_j->valuestring;
+        } else if (cap_ha_resolve_target(entity_j->valuestring, &e) == ESP_OK) {
+            resolved_eid = e.id;
+        } else {
+            cJSON_Delete(step); cJSON_Delete(arr);
+            snprintf(err_msg, err_msg_size,
+                     "condition.entity \"%s\" 를 해석하지 못했습니다.", entity_j->valuestring);
+            return ESP_ERR_INVALID_ARG;
+        }
+        cJSON_AddStringToObject(step, "condition", "state");
+        cJSON_AddStringToObject(step, "entity_id", resolved_eid);
+        /* Normalize state value to HA-native vocabulary (binary_sensor etc. use on/off). */
+        const char *cdot = strchr(resolved_eid, '.');
+        char cdom[20] = {0};
+        if (cdot && (size_t)(cdot - resolved_eid) < sizeof(cdom)) {
+            memcpy(cdom, resolved_eid, cdot - resolved_eid);
+        }
+        const char *state_val = normalize_state_value(cdom, state_j->valuestring);
+        cJSON_AddStringToObject(step, "state", state_val);
+    } else {
+        cJSON_Delete(step); cJSON_Delete(arr);
+        snprintf(err_msg, err_msg_size,
+                 "지원하지 않는 condition.kind 입니다 (%s). "
+                 "time_range / weekday / state 만 지원.", kind);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    cJSON_AddItemToArray(arr, step);
+    *condition_out = arr;
     return ESP_OK;
 }
 
@@ -408,7 +616,7 @@ static esp_err_t do_create(const cJSON *root, char *output, size_t output_size)
     /* Reject board:* targets — HA can't automate on-board entities. */
     if (strncmp(target_j->valuestring, "board:", 6) == 0) {
         emit_auto_failure(output, output_size,
-                          "보드 자체 자동화는 v5에서 지원될 예정입니다. v4에서는 HA 기기만 자동화 가능합니다.");
+                          "보드 자체 자동화는 현재 지원되지 않습니다 (HA 기기만 자동화 가능).");
         return ESP_OK;
     }
 
@@ -425,7 +633,7 @@ static esp_err_t do_create(const cJSON *root, char *output, size_t output_size)
     }
     if (strncmp(entity.domain, "board", 5) == 0) {
         emit_auto_failure(output, output_size,
-                          "보드 자체 자동화는 v5에서 지원될 예정입니다.");
+                          "보드 자체 자동화는 현재 지원되지 않습니다.");
         return ESP_OK;
     }
 
@@ -455,6 +663,32 @@ static esp_err_t do_create(const cJSON *root, char *output, size_t output_size)
         emit_auto_failure(output, output_size, err_msg);
         cJSON_Delete(action_arr);
         return ESP_OK;
+    }
+
+    /* User-provided condition (independent of trigger.weekly's auto-emit). */
+    const cJSON *user_cond = cJSON_GetObjectItem(root, "condition");
+    if (cJSON_IsObject(user_cond)) {
+        cJSON *user_cond_arr = NULL;
+        char cond_err[160];
+        if (build_ha_condition_array(user_cond, &user_cond_arr,
+                                     cond_err, sizeof(cond_err)) != ESP_OK) {
+            emit_auto_failure(output, output_size, cond_err);
+            cJSON_Delete(action_arr);
+            if (trigger_arr)   cJSON_Delete(trigger_arr);
+            if (condition_arr) cJSON_Delete(condition_arr);
+            return ESP_OK;
+        }
+        /* Merge: weekly auto-condition 이 있으면 AND, 없으면 user-only. */
+        if (condition_arr) {
+            cJSON *step = NULL;
+            cJSON_ArrayForEach(step, user_cond_arr) {
+                cJSON *dup = cJSON_Duplicate(step, true);
+                if (dup) cJSON_AddItemToArray(condition_arr, dup);
+            }
+            cJSON_Delete(user_cond_arr);
+        } else {
+            condition_arr = user_cond_arr;
+        }
     }
 
     cJSON *config = cJSON_CreateObject();
@@ -750,6 +984,27 @@ static esp_err_t do_update(const cJSON *root, char *output, size_t output_size)
         if (condition_arr) cJSON_AddItemToObject(cfg, "conditions", condition_arr);
     }
 
+    /* condition 만 단독 update (trigger 안 보내고 condition 만 보낸 경우),
+     * 또는 trigger 와 함께 update (위 블록에서 weekly auto-condition 만
+     * 들어가 있을 수 있음) 모두 처리. */
+    const cJSON *user_cond = cJSON_GetObjectItem(root, "condition");
+    if (cJSON_IsObject(user_cond)) {
+        cJSON *user_cond_arr = NULL;
+        char cond_err[160];
+        if (build_ha_condition_array(user_cond, &user_cond_arr,
+                                     cond_err, sizeof(cond_err)) != ESP_OK) {
+            cJSON_Delete(cfg);
+            emit_auto_failure(output, output_size, cond_err);
+            return ESP_OK;
+        }
+        /* user 가 condition 명시했으면 기존 conditions 를 완전 교체.
+         * 이전 trigger update 블록에서 weekly auto-condition 이 들어갔을 수
+         * 있으므로 그것까지 함께 교체됨 — 사용자 의도 우선. */
+        cJSON_DeleteItemFromObject(cfg, "condition");
+        cJSON_DeleteItemFromObject(cfg, "conditions");
+        cJSON_AddItemToObject(cfg, "conditions", user_cond_arr);
+    }
+
     /* target/device_action change → rebuild action[].
      * Caller may provide either or both; if missing, fall back to the existing
      * action[0]'s target.entity_id / service name. */
@@ -761,7 +1016,7 @@ static esp_err_t do_update(const cJSON *root, char *output, size_t output_size)
             if (strncmp(target_j->valuestring, "board:", 6) == 0) {
                 cJSON_Delete(cfg);
                 emit_auto_failure(output, output_size,
-                                  "보드 자체 자동화는 v5에서 지원될 예정입니다.");
+                                  "보드 자체 자동화는 현재 지원되지 않습니다.");
                 return ESP_OK;
             }
             target_name = target_j->valuestring;
