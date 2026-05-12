@@ -570,7 +570,7 @@ static esp_err_t do_create(const cJSON *root, char *output, size_t output_size)
     /* Reject board:* targets — HA can't automate on-board entities. */
     if (strncmp(target_j->valuestring, "board:", 6) == 0) {
         emit_auto_failure(output, output_size,
-                          "보드 자체 자동화는 v5에서 지원될 예정입니다. v4에서는 HA 기기만 자동화 가능합니다.");
+                          "보드 자체 자동화는 현재 지원되지 않습니다 (HA 기기만 자동화 가능).");
         return ESP_OK;
     }
 
@@ -587,7 +587,7 @@ static esp_err_t do_create(const cJSON *root, char *output, size_t output_size)
     }
     if (strncmp(entity.domain, "board", 5) == 0) {
         emit_auto_failure(output, output_size,
-                          "보드 자체 자동화는 v5에서 지원될 예정입니다.");
+                          "보드 자체 자동화는 현재 지원되지 않습니다.");
         return ESP_OK;
     }
 
@@ -970,7 +970,7 @@ static esp_err_t do_update(const cJSON *root, char *output, size_t output_size)
             if (strncmp(target_j->valuestring, "board:", 6) == 0) {
                 cJSON_Delete(cfg);
                 emit_auto_failure(output, output_size,
-                                  "보드 자체 자동화는 v5에서 지원될 예정입니다.");
+                                  "보드 자체 자동화는 현재 지원되지 않습니다.");
                 return ESP_OK;
             }
             target_name = target_j->valuestring;
