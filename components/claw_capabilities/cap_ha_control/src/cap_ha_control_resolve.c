@@ -311,7 +311,8 @@ esp_err_t cap_ha_resolve_refresh_from_ha(void)
         if (dlen >= sizeof(domain)) continue;
         memcpy(domain, id, dlen);
         if (strcmp(domain, "light") != 0 && strcmp(domain, "cover") != 0 &&
-            strcmp(domain, "switch") != 0) continue;
+            strcmp(domain, "switch") != 0 && strcmp(domain, "binary_sensor") != 0 &&
+            strcmp(domain, "sensor") != 0) continue;
 
         const cJSON *fn_j = cJSON_GetObjectItemCaseSensitive(attr, "friendly_name");
         const char *friendly = (cJSON_IsString(fn_j) && fn_j->valuestring[0])
