@@ -592,11 +592,29 @@ static esp_err_t do_service(const cJSON *root, const char *service,
     if (strncmp(id, "automation.", 11) == 0) id += 11;
 
     char entity_id[96];
-    /* Try resolving via attributes.id first (covers our esp_claw_<ts> form).
-     * If not found, fall back to "automation.<id>" — works when caller passed
-     * the already-slugified entity_id local part. */
-    if (resolve_entity_id_by_config_id(id, entity_id, sizeof(entity_id)) != ESP_OK) {
-        snprintf(entity_id, sizeof(entity_id), "automation.%s", id);
+    /* config_id (esp_claw_<ts>) 형식이면 resolver 가 cache + HA states 로 해석.
+     * 사용자가 이미 slug 화된 'automation.<slug>' 형식의 entity_id 를 그대로
+     * 넘긴 경우엔 resolver 가 NOT_FOUND 반환 — 그때만 입력값 그대로 사용. */
+    if (strncmp(id, "esp_claw_", 9) == 0) {
+        /* 우리 firmware 가 만든 config_id 인데 매핑 못 찾으면 fail. silent
+         * fallback ('automation.esp_claw_<ts>') 은 HA 가 slug 와 다른 entity
+         * 로 등록했을 때 service 가 200 응답하면서도 실제론 no-op 하는
+         * 버그를 만든다 (c04c845 commit message 참조). */
+        if (resolve_entity_id_by_config_id(id, entity_id, sizeof(entity_id)) != ESP_OK) {
+            char msg[240];
+            snprintf(msg, sizeof(msg),
+                     "automation_id '%s' 에 해당하는 HA 자동화를 찾을 수 없습니다. "
+                     "list 명령으로 현재 등록된 entity_id 를 확인하세요.", id);
+            emit_auto_failure(output, output_size, msg);
+            return ESP_OK;
+        }
+    } else {
+        /* 'living_room_lights' 같은 사용자 slug — resolver 가 못 잡지만 그대로
+         * 사용 가능한 패턴. resolver 가 잡으면 더 정확하니 시도하되, 실패해도
+         * verbatim 통과. */
+        if (resolve_entity_id_by_config_id(id, entity_id, sizeof(entity_id)) != ESP_OK) {
+            snprintf(entity_id, sizeof(entity_id), "automation.%s", id);
+        }
     }
 
     char http_resp[256];
