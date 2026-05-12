@@ -90,10 +90,33 @@ static cJSON *build_ha_action_array(const cap_ha_entity_t *entity,
     return arr;
 }
 
+/* For domains whose HA state vocabulary is exactly "on"/"off"
+ * (binary_sensor / light / switch / input_boolean), translate the
+ * door/window-flavored synonyms LLMs often pick from UI labels
+ * ("Open"/"Closed" display) into the actual state values HA matches
+ * against. Without this, an LLM that hears "도어 열림" naturally writes
+ * to:"open", the automation registers, and HA never fires it because
+ * the entity's state value is never literally "open" — it is "on".
+ * cover/lock keep their native vocabulary as-is. */
+static const char *normalize_state_value(const char *domain, const char *value)
+{
+    if (!domain || !value) return value;
+    if (strcmp(domain, "binary_sensor") == 0 ||
+        strcmp(domain, "light") == 0 ||
+        strcmp(domain, "switch") == 0 ||
+        strcmp(domain, "input_boolean") == 0) {
+        if (strcmp(value, "open")   == 0) return "on";
+        if (strcmp(value, "opened") == 0) return "on";
+        if (strcmp(value, "closed") == 0) return "off";
+    }
+    return value;
+}
+
 /* Return the natural opposite of `to_val` for `domain`, or NULL if no
  * sensible default exists. Used in state trigger to force HA transition
  * semantics — `to: "on"` alone fires on every attribute-update, but
- * pairing with `from: "off"` makes HA require an actual transition. */
+ * pairing with `from: "off"` makes HA require an actual transition.
+ * Caller is expected to pass `to_val` already through normalize_state_value. */
 static const char *opposite_state(const char *domain, const char *to_val)
 {
     if (!domain || !to_val) return NULL;
@@ -247,26 +270,42 @@ static esp_err_t build_ha_trigger_array(const cJSON *trigger_in,
         cJSON *step = cJSON_CreateObject();
         cJSON_AddStringToObject(step, "platform", "state");
         cJSON_AddStringToObject(step, "entity_id", resolved_eid);
-        cJSON_AddStringToObject(step, "to", to_j->valuestring);
+
+        /* resolved_eid is always "domain.local". Extract domain so we can
+         * normalize state values per domain vocabulary and auto-fill from. */
+        const char *dot = strchr(resolved_eid, '.');
+        char dom[20] = {0};
+        if (dot && (size_t)(dot - resolved_eid) < sizeof(dom)) {
+            memcpy(dom, resolved_eid, dot - resolved_eid);
+        }
+
+        /* Normalize to/from for on-off domains: "open"→"on", "closed"→"off".
+         * Critical for door/window binary_sensors where LLM hears the UI
+         * label "Open" and writes to:"open" — would register but never fire. */
+        const char *to_val = normalize_state_value(dom, to_j->valuestring);
+        cJSON_AddStringToObject(step, "to", to_val);
+        if (strcmp(to_val, to_j->valuestring) != 0) {
+            ESP_LOGI(TAG, "state trigger to normalized: %s -> %s (domain=%s)",
+                     to_j->valuestring, to_val, dom);
+        }
 
         /* from priority:
-         * 1) caller specified → pass verbatim (override allowed)
+         * 1) caller specified → normalize, pass through (override allowed)
          * 2) otherwise domain-pair opposite auto-fill (force transition)
          * 3) no opposite for this domain → omit (HA default behavior) */
         if (cJSON_IsString(from_j) && from_j->valuestring[0]) {
-            cJSON_AddStringToObject(step, "from", from_j->valuestring);
+            const char *from_val = normalize_state_value(dom, from_j->valuestring);
+            cJSON_AddStringToObject(step, "from", from_val);
+            if (strcmp(from_val, from_j->valuestring) != 0) {
+                ESP_LOGI(TAG, "state trigger from normalized: %s -> %s (domain=%s)",
+                         from_j->valuestring, from_val, dom);
+            }
         } else {
-            /* resolved_eid is always "domain.local". Extract domain. */
-            const char *dot = strchr(resolved_eid, '.');
-            char dom[20] = {0};
-            if (dot && (size_t)(dot - resolved_eid) < sizeof(dom)) {
-                memcpy(dom, resolved_eid, dot - resolved_eid);
-                const char *auto_from = opposite_state(dom, to_j->valuestring);
-                if (auto_from) {
-                    cJSON_AddStringToObject(step, "from", auto_from);
-                    ESP_LOGI(TAG, "state trigger from auto-fill: %s -> %s (domain=%s)",
-                             auto_from, to_j->valuestring, dom);
-                }
+            const char *auto_from = opposite_state(dom, to_val);
+            if (auto_from) {
+                cJSON_AddStringToObject(step, "from", auto_from);
+                ESP_LOGI(TAG, "state trigger from auto-fill: %s -> %s (domain=%s)",
+                         auto_from, to_val, dom);
             }
         }
         cJSON_AddItemToArray(arr, step);
@@ -389,7 +428,14 @@ static esp_err_t build_ha_condition_array(const cJSON *condition_in,
         }
         cJSON_AddStringToObject(step, "condition", "state");
         cJSON_AddStringToObject(step, "entity_id", resolved_eid);
-        cJSON_AddStringToObject(step, "state", state_j->valuestring);
+        /* Normalize state value to HA-native vocabulary (binary_sensor etc. use on/off). */
+        const char *cdot = strchr(resolved_eid, '.');
+        char cdom[20] = {0};
+        if (cdot && (size_t)(cdot - resolved_eid) < sizeof(cdom)) {
+            memcpy(cdom, resolved_eid, cdot - resolved_eid);
+        }
+        const char *state_val = normalize_state_value(cdom, state_j->valuestring);
+        cJSON_AddStringToObject(step, "state", state_val);
     } else {
         cJSON_Delete(step); cJSON_Delete(arr);
         snprintf(err_msg, err_msg_size,
