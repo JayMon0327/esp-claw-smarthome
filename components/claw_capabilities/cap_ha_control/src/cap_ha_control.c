@@ -69,10 +69,13 @@ static claw_cap_descriptor_t s_ha_descriptors[] = {
               "\"automation_id\":{\"type\":\"string\",\"description\":\"HA entity local id (without 'automation.' prefix). create assigns automatically (esp_claw_<ts>).\"},"
               "\"alias\":{\"type\":\"string\",\"description\":\"Human-readable name visible in HA UI.\"},"
               "\"trigger\":{\"type\":\"object\",\"properties\":{"
-                "\"kind\":{\"type\":\"string\",\"enum\":[\"daily_time\",\"weekly\",\"interval\"]},"
+                "\"kind\":{\"type\":\"string\",\"enum\":[\"daily_time\",\"weekly\",\"interval\",\"state\"]},"
                 "\"time\":{\"type\":\"string\",\"description\":\"daily_time/weekly: 'HH:MM' 24h KST\"},"
                 "\"weekdays\":{\"type\":\"array\",\"items\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":6},\"description\":\"weekly: 0=Sunday\"},"
-                "\"interval_ms\":{\"type\":\"integer\",\"minimum\":2000}"
+                "\"interval_ms\":{\"type\":\"integer\",\"minimum\":2000},"
+                "\"entity\":{\"type\":\"string\",\"description\":\"state: friendly name or entity_id of the entity whose state change fires the automation (e.g., '현관 도어센서' or 'binary_sensor.front_door').\"},"
+                "\"to\":{\"type\":\"string\",\"description\":\"state: required target state ('on'/'off'/'open'/'closed' etc).\"},"
+                "\"from\":{\"type\":\"string\",\"description\":\"state: optional previous state. If omitted, fires on any transition into 'to'.\"}"
               "}},"
               "\"target\":{\"type\":\"string\",\"description\":\"HA entity friendly name or entity_id. board:* targets are not supported in v4 (HA-side automation only).\"},"
               "\"device_action\":{\"type\":\"string\",\"enum\":[\"turn_on\",\"turn_off\",\"toggle\",\"open\",\"close\"]},"
@@ -98,9 +101,11 @@ void cap_ha_compose_description(void)
     s_ha_descriptors[0].description = s_ha_description;
 
     snprintf(s_ha_automation_description, sizeof(s_ha_automation_description),
-             "Register/modify/remove time-based automations on Home Assistant. "
-             "Active devices (use these names verbatim in 'target'): %s. "
+             "Register/modify/remove automations on Home Assistant. "
+             "Active devices (use these names verbatim in 'target' or in trigger.entity): %s. "
              "board:* targets (onboard RGB) are NOT supported here — those would require on-device automation, planned for v5. "
+             "Trigger kinds: 'daily_time' (HH:MM), 'weekly' (HH:MM + weekdays[]), 'interval' (interval_ms ≥ 2000), "
+             "'state' (entity + to + optional from — e.g., door sensor opens → light on). "
              "Use 'create' (assigns automation_id), 'update' (needs automation_id), 'remove' (needs automation_id), "
              "'list' (returns existing automations), 'trigger_now' (force-fire by id), 'enable'/'disable' (toggle by id). "
              "After this tool returns, respond to the user with the result 'message' field VERBATIM.",
